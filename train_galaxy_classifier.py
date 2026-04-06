@@ -191,8 +191,13 @@ def main() -> None:
 
     image_paths, labels = list_images(args.data_dir)
     if args.max_images > 0:
-        image_paths = image_paths[: args.max_images]
-        labels = labels[: args.max_images]
+        # Combine, shuffle, and unzip to ensure a random mix of classes
+        combined = list(zip(image_paths, labels))
+        random.shuffle(combined)
+        image_paths, labels = zip(*combined)
+
+        image_paths = list(image_paths)[: args.max_images]
+        labels = list(labels)[: args.max_images]
 
     x, y, idx_to_class, _ = load_images(image_paths, labels, args.image_size)
     x_train, x_val, x_test, y_train_int, y_val_int, y_test_int = split_dataset(x, y, args.seed)
