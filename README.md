@@ -22,9 +22,7 @@ GalaxyNet-CPU/
 ├── README.md
 ├── requirements.txt
 ├── train_galaxy_classifier.py
-├── research_paper_template.md
-└── scripts/
-    └── organize_dataset.py
+└── research_paper_template.md
 ```
 
 ## Setup
@@ -35,27 +33,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Where to Get Galaxy Data (Bulk)
+## Data Layout
 
-You can get galaxy morphology data in two practical ways:
-
-1. **Kaggle (easiest bulk download)**
-   - Recommended for a student project because images are typically pre-packaged.
-   - Install the Kaggle CLI and set your API token (`~/.kaggle/kaggle.json`).
-   - Example bulk download:
-
-   ```bash
-   kaggle competitions download -c galaxy-zoo-the-galaxy-challenge -p data/raw
-   unzip data/raw/galaxy-zoo-the-galaxy-challenge.zip -d data/raw
-   ```
-
-2. **Galaxy Zoo official data releases (research-grade catalogs)**
-   - Best if you want original catalog-level labels and publication-grade provenance.
-   - Download images/catalogs from official Galaxy Zoo data pages and then organize them into class folders.
-
-## Data Layout Required by This Project
-
-The training script expects class folders exactly like this:
+Put your dataset into class folders:
 
 ```text
 data/
@@ -71,27 +51,6 @@ data/
 ```
 
 Supported image types: `.jpg`, `.jpeg`, `.png`.
-
-## Organize Data Automatically
-
-If you have:
-- a flat image folder (for example `data/raw/images/`), and
-- a CSV labels file with columns `filename,label`
-
-you can organize your dataset in bulk:
-
-```bash
-python scripts/organize_dataset.py \
-  --images-dir data/raw/images \
-  --labels-csv data/raw/labels.csv \
-  --output-dir data \
-  --mode copy
-```
-
-Valid labels are:
-- `spiral`
-- `elliptical`
-- `irregular`
 
 ## Train
 
