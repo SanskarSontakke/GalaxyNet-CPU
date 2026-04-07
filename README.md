@@ -1,97 +1,102 @@
-# GalaxyNet-CPU
+# GalaxyNet-CPU (Kaggle-ready TensorFlow Pipeline)
 
-CPU-first machine learning pipeline for Galaxy Zoo image classification (spiral, elliptical, irregular).
+Production-style Galaxy Zoo 3-class classifier (`spiral`, `elliptical`, `irregular`) using:
 
-## Features
+- Corrected Galaxy Zoo hierarchical label logic.
+- `tf.data` path-based loading (no full-RAM image arrays).
+- EfficientNetV2B0 transfer learning (warm-up + fine-tuning).
+- Focal Loss with inverse-frequency alpha.
+- TTA, confusion matrices, ROC, kappa/MCC, and CV stability check.
 
-- End-to-end training/evaluation script for **CPU-only** systems.
-- Image preprocessing (resize, normalize, label encoding).
-- Dataset split with target ratios: **70% train / 15% validation / 15% test**.
-- Lightweight CNN baseline (<2M parameters).
-- Training with class weighting, early stopping, and reproducibility controls.
-- Outputs:
-  - Trained model
-  - Accuracy and loss curves
-  - Confusion matrix
-  - JSON metrics report
-
-## Project Structure
+## Repository Layout
 
 ```text
-GalaxyNet-CPU/
-├── README.md
+galaxynet/
+├── config.py
+├── dataset.py
+├── model.py
+├── losses.py
+├── train.py
+├── evaluate.py
+├── utils.py
+├── make_labels.py
 ├── requirements.txt
-├── train_galaxy_classifier.py
-└── research_paper_template.md
+├── kernel-metadata.json
+└── README.md
 ```
 
-## Setup
+## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r galaxynet/requirements.txt
 ```
 
-## Data Layout
+## Kaggle Run
 
-Put your dataset into class folders:
-
-```text
-data/
-├── spiral/
-│   ├── img1.jpg
-│   └── ...
-├── elliptical/
-│   ├── img2.jpg
-│   └── ...
-└── irregular/
-    ├── img3.jpg
-    └── ...
-```
-
-Supported image types: `.jpg`, `.jpeg`, `.png`.
-
-## Train
+Use a Kaggle notebook/script with dataset `galaxy-zoo-the-galaxy-challenge` attached.
 
 ```bash
-python train_galaxy_classifier.py \
-  --data-dir data \
-  --output-dir outputs \
-  --image-size 64 \
-  --epochs 20 \
-  --batch-size 32
+python -m galaxynet.train
 ```
 
-## Recommended CPU Settings
+The training script will:
+1. unzip `training_solutions_rev1.zip` and `images_training_rev1.zip` to `/kaggle/temp`
+2. generate cleaned 3-class labels with hierarchical thresholds
+3. stratify split (70/15/15)
+4. train in two phases
+5. save full metrics and plots to `/kaggle/working/outputs`
 
-- `--image-size 96` (96×96 is still comfortable on a modern 4-core CPU)
-- `--batch-size 16`
-- `--epochs 40`
-- `--max-images 15000` (optional cap)
+## Local Run
+
+```bash
+python -m galaxynet.train \
+  --solutions-csv /path/to/training_solutions_rev1.csv \
+  --image-dir /path/to/images_training_rev1
+```
+
+Or if you already generated labels:
+
+```bash
+python -m galaxynet.train \
+  --labels-csv /path/to/labels.csv \
+  --image-dir /path/to/images_training_rev1
+```
+
+## Standalone Label Generation
+
+```bash
+python -m galaxynet.make_labels \
+  --solutions-csv /path/to/training_solutions_rev1.csv \
+  --image-dir /path/to/images_training_rev1 \
+  --output-csv labels.csv
+```
+
+## Correct Label Rules (Implemented)
+
+- `elliptical`: `Class1.1 >= 0.469`
+- `spiral`: `Class1.2 >= 0.430` **and** `Class4.1 >= 0.430`
+- `irregular`: `Class6.1 >= 0.469` and not elliptical and not spiral
+- else dropped as `unknown`
 
 ## Outputs
 
-The script creates:
+Saved under `outputs/`:
 
-- `outputs/galaxy_cnn.keras`
-- `outputs/training_curves.png`
-- `outputs/confusion_matrix.png`
-- `outputs/metrics.json`
-
-`metrics.json` includes:
-
-- train/val/test sizes
-- test accuracy and loss
-- training time
-- inference latency per image
-- class mapping and model parameter count
-
-## Reproducibility
-
-Use `--seed` (default: `42`) for deterministic shuffling/splits and consistent initialization.
+- `labels.csv`
+- `best_model.keras`
+- `warmup_best.keras`
+- `training_log.csv`
+- `training_curves_warmup.png`
+- `training_curves_finetune.png`
+- `confusion_matrix.png`
+- `confusion_matrix_normalized.png`
+- `class_metrics_bar.png`
+- `roc_curves.png`
+- `prediction_confidence_histogram.png`
+- `metrics.json`
 
 ## Notes
 
-- This baseline is intentionally lightweight for student-friendly CPU training.
-- For better accuracy, consider careful augmentation, class balancing, and hyperparameter tuning.
+- No `RandomOverSampler` is used.
+- All splits are path-based and non-overlapping.
+- EfficientNet preprocessing is left internal (images passed as float32 in `[0,255]`).
