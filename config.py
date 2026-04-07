@@ -7,7 +7,7 @@ from pathlib import Path
 @dataclass
 class Config:
     # Paths
-    kaggle_input_dir: Path = Path('/kaggle/input/galaxy-zoo-the-galaxy-challenge')
+    kaggle_input_dir: Path = Path('/kaggle/input/competitions/galaxy-zoo-the-galaxy-challenge')
     kaggle_temp_dir: Path = Path('/kaggle/temp')
     output_dir: Path = Path('/kaggle/working/outputs')
 
@@ -18,7 +18,7 @@ class Config:
 
     # Data
     image_size: int = 128
-    batch_size: int = 32
+    batch_size: int = 64
     seed: int = 42
     val_split: float = 0.15
     test_split: float = 0.15
@@ -34,9 +34,10 @@ class Config:
     warmup_lr: float = 1e-3
 
     # Training phase 2
-    finetune_epochs: int = 50
+    finetune_epochs: int = 30
     finetune_lr: float = 1e-5
     finetune_unfreeze_last_n: int = 30
+    use_oversampling: bool = True
 
     # Focal Loss
     focal_gamma: float = 2.0

@@ -10,7 +10,7 @@ from typing import Tuple
 import numpy as np
 import tensorflow as tf
 
-from galaxynet.config import Config
+from config import Config
 
 
 def set_global_seed(seed: int) -> None:

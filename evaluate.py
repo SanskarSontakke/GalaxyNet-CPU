@@ -17,8 +17,8 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedKFold
 
-from galaxynet.config import Config
-from galaxynet.dataset import CLASS_NAMES, augment_image, build_dataset
+from config import Config
+from dataset import CLASS_NAMES, augment_image, build_dataset
 
 
 def _dataset_to_arrays(df: pd.DataFrame):
@@ -118,7 +118,8 @@ def cross_val_stability_check(labels_df: pd.DataFrame, build_model_fn, config: C
         base_model.trainable = False
         model.compile(optimizer=tf.keras.optimizers.Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
         model.fit(train_ds, validation_data=val_ds, epochs=config.cv_finetune_epochs, verbose=0)
-        _, val_acc = model.evaluate(val_ds, verbose=0)
+        eval_out = model.evaluate(val_ds, verbose=0)
+        val_acc = eval_out[1] # [loss, accuracy, ...]
         accs.append(float(val_acc))
 
     return float(np.mean(accs)), float(np.std(accs))
@@ -136,7 +137,8 @@ def evaluate_model(
     test_ds = build_dataset(test_paths, test_y_onehot, config.image_size, config.batch_size)
 
     start = time.perf_counter()
-    test_loss, test_acc = model.evaluate(test_ds, verbose=0)
+    eval_out = model.evaluate(test_ds, verbose=0)
+    test_loss, test_acc = eval_out[0], eval_out[1]
     probs = model.predict(test_ds, verbose=0)
     infer_ms = (time.perf_counter() - start) * 1000.0 / len(test_df)
 

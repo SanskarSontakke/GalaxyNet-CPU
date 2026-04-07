@@ -8,12 +8,23 @@ from pathlib import Path
 import pandas as pd
 import tensorflow as tf
 
-from galaxynet.config import Config
-from galaxynet.dataset import build_datasets, compute_alpha_from_counts, generate_labels_df
-from galaxynet.evaluate import evaluate_model, plot_training_curves
-from galaxynet.losses import FocalLoss
-from galaxynet.model import build_model, unfreeze_top_layers
-from galaxynet.utils import is_kaggle_runtime, save_json, setup_environment, setup_kaggle_environment
+import sys
+if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import Config
+from dataset import build_datasets, compute_alpha_from_counts, generate_labels_df
+from evaluate import evaluate_model, plot_training_curves
+from losses import FocalLoss
+from model import build_model, unfreeze_top_layers
+from utils import is_kaggle_runtime, save_json, setup_environment, setup_kaggle_environment
+
+
+class ConciseLogging(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        msg = f"Epoch {epoch+1:03d} | loss: {logs.get('loss', 0):.4f} | acc: {logs.get('accuracy', 0):.4f} | val_loss: {logs.get('val_loss', 0):.4f} | val_acc: {logs.get('val_accuracy', 0):.4f}"
+        print(msg)
 
 
 def _metrics():
@@ -35,10 +46,11 @@ def run_training(train_ds, val_ds, class_counts: dict[str, int], config: Config,
     warmup_callbacks = [
         tf.keras.callbacks.ModelCheckpoint(output_dir / 'warmup_best.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
         tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True),
+        ConciseLogging(),
     ]
 
     warmup_start = time.perf_counter()
-    h1 = model.fit(train_ds, validation_data=val_ds, epochs=config.warmup_epochs, callbacks=warmup_callbacks)
+    h1 = model.fit(train_ds, validation_data=val_ds, epochs=config.warmup_epochs, callbacks=warmup_callbacks, verbose=0)
     warmup_seconds = time.perf_counter() - warmup_start
 
     unfrozen = unfreeze_top_layers(base_model, config.finetune_unfreeze_last_n)
@@ -49,10 +61,11 @@ def run_training(train_ds, val_ds, class_counts: dict[str, int], config: Config,
         tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=8, restore_best_weights=True),
         tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1),
         tf.keras.callbacks.CSVLogger(output_dir / 'training_log.csv'),
+        ConciseLogging(),
     ]
 
     finetune_start = time.perf_counter()
-    h2 = model.fit(train_ds, validation_data=val_ds, epochs=config.finetune_epochs, callbacks=finetune_callbacks)
+    h2 = model.fit(train_ds, validation_data=val_ds, epochs=config.finetune_epochs, callbacks=finetune_callbacks, verbose=0)
     finetune_seconds = time.perf_counter() - finetune_start
 
     best_path = output_dir / 'best_model.keras'
@@ -82,6 +95,11 @@ def parse_local_args() -> tuple[Path, Path, Path | None]:
 
 def main():
     config = Config()
+    if config.enable_mixed_precision:
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print(f"Mixed precision enabled: {policy.name}")
+
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     setup_environment(config)
@@ -103,7 +121,8 @@ def main():
         labels_df.to_csv(output_dir / 'labels.csv', index=False)
 
     train_ds, val_ds, test_ds, class_counts, split_info, (_, _, test_df) = build_datasets(labels_df, config)
-    assert split_info['train_size'] + split_info['val_size'] + split_info['test_size'] == split_info['total_labeled_images']
+    # With oversampling, the total images used for training may exceed the original dataset count.
+    assert split_info['train_size'] + split_info['val_size'] + split_info['test_size'] >= split_info['total_labeled_images']
 
     model, h1, h2, train_meta = run_training(train_ds, val_ds, class_counts, config, output_dir)
 

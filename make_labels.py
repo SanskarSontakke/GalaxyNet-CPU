@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from galaxynet.config import Config
-from galaxynet.dataset import generate_labels_df
+from config import Config
+from dataset import generate_labels_df
 
 
 def main() -> None:

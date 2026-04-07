@@ -9,7 +9,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 
-from galaxynet.config import Config
+from config import Config
 
 try:
     import tensorflow_addons as tfa
@@ -160,6 +160,18 @@ def _assert_non_overlap(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: p
 def build_datasets(labels_df: pd.DataFrame, config: Config):
     train_df, val_df, test_df = _split_dataframe(labels_df, config)
     _assert_non_overlap(train_df, val_df, test_df)
+
+    if config.use_oversampling:
+        counts = train_df['label'].value_counts().to_dict()
+        max_c = max(counts.values())
+        to_concat = []
+        for cls, count in counts.items():
+            if count < max_c:
+                ratio = int(max_c / count) - 1
+                if ratio > 0:
+                    to_concat.append(train_df[train_df['label'] == cls].sample(n=ratio*count, replace=True, random_state=config.seed))
+        if to_concat:
+            train_df = pd.concat([train_df] + to_concat).sample(frac=1, random_state=config.seed).reset_index(drop=True)
 
     class_counts = labels_df['label'].value_counts().reindex(CLASS_NAMES, fill_value=0).to_dict()
 

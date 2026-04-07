@@ -1,7 +1,7 @@
 {
   "id": "sanskarsontakke/galaxynet-training",
   "title": "GalaxyNet Training",
-  "code_file": "train_galaxy_classifier.py",
+  "code_file": "train_kaggle_bundle.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": true,
