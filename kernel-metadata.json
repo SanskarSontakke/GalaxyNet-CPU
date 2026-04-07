@@ -1,0 +1,15 @@
+{
+  "id": "sanskarsontakke/galaxynet-training",
+  "title": "GalaxyNet Training",
+  "code_file": "train_galaxy_classifier.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [
+    "galaxy-zoo-the-galaxy-challenge"
+  ]
+}

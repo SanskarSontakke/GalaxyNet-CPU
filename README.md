@@ -63,10 +63,11 @@ python train_galaxy_classifier.py \
   --batch-size 32
 ```
 
-### Recommended CPU Settings
+## Recommended CPU Settings
 
-- `--image-size 64`
-- `--batch-size 16` or `32`
+- `--image-size 96` (96×96 is still comfortable on a modern 4-core CPU)
+- `--batch-size 16`
+- `--epochs 40`
 - `--max-images 15000` (optional cap)
 
 ## Outputs

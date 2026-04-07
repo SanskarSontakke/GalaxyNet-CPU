@@ -15,9 +15,28 @@ def determine_class(row):
         return 'unknown'
 
 def main():
-    print("Loading Kaggle solutions...")
-    # Update this path if your extracted Kaggle csv is in a different folder
-    csv_path = 'galaxy_raw/training_solutions_rev1.csv' 
+    import os
+    import sys
+
+    # Standard locations for the Kaggle CSV
+    possible_paths = [
+        'galaxy_raw/training_solutions_rev1.csv',
+        '/kaggle/input/galaxy-zoo-the-galaxy-challenge/training_solutions_rev1.csv',
+        'training_solutions_rev1.csv'
+    ]
+    
+    # Allow command line override
+    if len(sys.argv) > 1:
+        csv_path = sys.argv[1]
+    else:
+        csv_path = next((p for p in possible_paths if os.path.exists(p)), None)
+
+    if not csv_path:
+        print("Error: Could not find training_solutions_rev1.csv")
+        print(f"Looked in: {', '.join(possible_paths)}")
+        return
+
+    print(f"Loading Kaggle solutions from {csv_path}...")
     df = pd.read_csv(csv_path)
 
     print("Applying classification logic...")
