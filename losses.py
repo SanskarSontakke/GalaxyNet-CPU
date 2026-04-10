@@ -4,24 +4,35 @@ import tensorflow as tf
 
 
 class FocalLoss(tf.keras.losses.Loss):
-    def __init__(self, gamma: float = 2.0, alpha: list[float] | None = None, name: str = 'focal_loss'):
-        super().__init__(name=name)
+    def __init__(self, alpha: list[float] | None = None, gamma: float = 2.0, name: str = 'focal_loss', label_smoothing: float = 0.0, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.alpha = alpha
         self.gamma = gamma
-        self.alpha = tf.constant(alpha if alpha is not None else [1.0, 1.0, 1.0], dtype=tf.float32)
+        self.label_smoothing = label_smoothing
 
-    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), 1e-7, 1.0 - 1e-7)
+    def call(self, y_true, y_pred):
+        # Elite Improvement: Label Smoothing
+        if self.label_smoothing > 0:
+            num_classes = tf.cast(tf.shape(y_true)[-1], y_true.dtype)
+            y_true = y_true * (1.0 - self.label_smoothing) + (self.label_smoothing / num_classes)
 
-        p_t = tf.reduce_sum(y_true * y_pred, axis=-1)
-        alpha_t = tf.reduce_sum(y_true * self.alpha, axis=-1)
-        focal_factor = tf.pow(1.0 - p_t, self.gamma)
-        loss = -alpha_t * focal_factor * tf.math.log(p_t)
-        return tf.reduce_mean(loss)
+        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        
+        # Categorical cross entropy core
+        cross_entropy = -y_true * tf.math.log(y_pred)
+        
+        # Focal weight: (1 - p)^gamma
+        weight = tf.pow(1.0 - y_pred, self.gamma)
+        loss = weight * cross_entropy
+        
+        # Class balanced alpha scaling
+        if self.alpha is not None:
+            alpha = tf.constant(self.alpha, dtype=y_true.dtype)
+            loss = alpha * loss
+            
+        return tf.reduce_sum(loss, axis=-1)
 
     def get_config(self):
-        return {
-            'gamma': self.gamma,
-            'alpha': self.alpha.numpy().tolist(),
-            'name': self.name,
-        }
+        config = super().get_config()
+        config.update({'alpha': self.alpha, 'gamma': self.gamma, 'label_smoothing': self.label_smoothing})
+        return config

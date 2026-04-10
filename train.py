@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import gc
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import tensorflow as tf
 
 import sys
@@ -13,7 +15,7 @@ if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import Config
-from dataset import build_datasets, compute_alpha_from_counts, generate_labels_df
+from dataset import build_datasets, build_dataset, compute_alpha_from_counts, generate_labels_df, compute_sample_weights
 from evaluate import evaluate_model, plot_training_curves
 from losses import FocalLoss
 from model import build_model, unfreeze_top_layers
@@ -23,7 +25,8 @@ from utils import is_kaggle_runtime, save_json, setup_environment, setup_kaggle_
 class ConciseLogging(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        msg = f"Epoch {epoch+1:03d} | loss: {logs.get('loss', 0):.4f} | acc: {logs.get('accuracy', 0):.4f} | val_loss: {logs.get('val_loss', 0):.4f} | val_acc: {logs.get('val_accuracy', 0):.4f}"
+        msg = (f"Epoch {epoch+1:03d} | loss: {logs.get('loss', 0):.4f} | "
+               f"acc: {logs.get('accuracy', 0):.4f} | val_acc: {logs.get('val_accuracy', 0):.4f}")
         print(msg)
 
 
@@ -36,61 +39,100 @@ def _metrics():
     ]
 
 
-def run_training(train_ds, val_ds, class_counts: dict[str, int], config: Config, output_dir: Path):
+def _train_head_isolated(arch, train_df, val_df, class_counts, config_dict, output_dir_str):
+    import gc
+    import json
+    
+    # VRAM Isolated profile batch sizing
+    config = Config(**config_dict)
+    output_dir = Path(output_dir_str)
+    bs_finetune = 16 if arch == 'ConvNeXtTiny' else config.batch_size_finetune
+
+    tf.keras.backend.clear_session()
+    
     alpha = compute_alpha_from_counts(class_counts)
-    focal = FocalLoss(gamma=config.focal_gamma, alpha=alpha)
+    focal = FocalLoss(gamma=config.focal_gamma, alpha=alpha, label_smoothing=config.label_smoothing)
+    current_size = config.image_size_warmup
 
-    model, base_model = build_model(config.image_size, num_classes=3)
+    print(f"\n[Training Ensemble Head: {arch}]")
+    
+    # 1. Warmup
+    tr_x = train_df['image_path'].astype(str).to_numpy()
+    tr_y = tf.keras.utils.to_categorical(train_df['label_id'].to_numpy(), 3)
+    train_weights = compute_sample_weights(train_df) if config.use_sample_weighting else None
+    
+    va_x = val_df['image_path'].astype(str).to_numpy()
+    va_y = tf.keras.utils.to_categorical(val_df['label_id'].to_numpy(), 3)
+    
+    train_ds = build_dataset(tr_x, tr_y, current_size, config.batch_size, weights=train_weights, augment=True, shuffle=True)
+    val_ds = build_dataset(va_x, va_y, current_size, config.batch_size, augment=False, shuffle=False)
 
+    model, base_model = build_model(current_size, num_classes=3, architecture=arch)
     model.compile(optimizer=tf.keras.optimizers.Adam(config.warmup_lr), loss=focal, metrics=_metrics())
+    
     warmup_callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(output_dir / 'warmup_best.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
-        tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True),
-        ConciseLogging(),
+        tf.keras.callbacks.ModelCheckpoint(output_dir / f'warmup_{arch}.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
+        tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=3, restore_best_weights=True),
+        ConciseLogging()
     ]
 
-    warmup_start = time.perf_counter()
+    print(f"Warmup @ {current_size}px...")
     h1 = model.fit(train_ds, validation_data=val_ds, epochs=config.warmup_epochs, callbacks=warmup_callbacks, verbose=0)
-    warmup_seconds = time.perf_counter() - warmup_start
 
-    unfrozen = unfreeze_top_layers(base_model, config.finetune_unfreeze_last_n)
-    model.compile(optimizer=tf.keras.optimizers.Adam(config.finetune_lr), loss=focal, metrics=_metrics())
+    # 2. Fine-tuning
+    new_size = config.image_size_finetune
+    print(f"Transitioning to Fine-Tuning @ {new_size}px... (Batch Size: {bs_finetune})")
+    
+    tr_w = (train_df['label_id'].map({cid: 2.0 if cid == 2 else 1.0 for cid in range(3)})).to_numpy()
+    
+    train_ds_hf = build_dataset(tr_x, tr_y, new_size, bs_finetune, weights=tr_w, augment=True, shuffle=True, cache=False)
+    val_ds_hf = build_dataset(va_x, va_y, new_size, bs_finetune, augment=False, shuffle=False, cache=False)
+    
+    unfreeze_top_layers(base_model, config.finetune_unfreeze_last_n)
+    
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        config.finetune_lr, decay_steps=config.finetune_epochs * (len(train_df) // bs_finetune)
+    )
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr_schedule), loss=focal, metrics=_metrics())
 
     finetune_callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(output_dir / 'best_model.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
+        tf.keras.callbacks.ModelCheckpoint(output_dir / f'best_{arch}.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
         tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=8, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1),
-        tf.keras.callbacks.CSVLogger(output_dir / 'training_log.csv'),
-        ConciseLogging(),
+        ConciseLogging()
     ]
-
-    finetune_start = time.perf_counter()
-    h2 = model.fit(train_ds, validation_data=val_ds, epochs=config.finetune_epochs, callbacks=finetune_callbacks, verbose=0)
-    finetune_seconds = time.perf_counter() - finetune_start
-
-    best_path = output_dir / 'best_model.keras'
-    model = tf.keras.models.load_model(best_path, custom_objects={'FocalLoss': FocalLoss})
-
-    return model, h1.history, h2.history, {
-        'alpha': alpha,
-        'warmup_seconds': warmup_seconds,
-        'finetune_seconds': finetune_seconds,
-        'unfrozen_layers': unfrozen,
-    }
+    
+    h2 = model.fit(train_ds_hf, validation_data=val_ds_hf, epochs=config.finetune_epochs, callbacks=finetune_callbacks, verbose=0)
+    
+    result = { 'h1': h1.history, 'h2': h2.history }
+    with open(output_dir / f'{arch}_history.json', 'w') as f:
+        json.dump(result, f)
 
 
-def parse_local_args() -> tuple[Path, Path, Path | None]:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--solutions-csv', type=Path, required=False)
-    parser.add_argument('--image-dir', type=Path, required=False)
-    parser.add_argument('--labels-csv', type=Path, required=False)
-    args = parser.parse_args()
+def run_ensemble_training(train_df, val_df, class_counts, config: Config, output_dir: Path):
+    import multiprocessing
+    import json
+    from dataclasses import asdict
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
-    if args.labels_csv is not None and args.image_dir is not None:
-        return args.labels_csv, args.image_dir, args.labels_csv
-    if args.solutions_csv is None or args.image_dir is None:
-        raise ValueError('Local mode requires --solutions-csv and --image-dir (or --labels-csv and --image-dir).')
-    return args.solutions_csv, args.image_dir, None
+    ensemble_results = {}
+    config_dict = asdict(config)
+    output_dir_str = str(output_dir)
+
+    for arch in config.ensemble_architectures:
+        p = multiprocessing.Process(target=_train_head_isolated, args=(arch, train_df, val_df, class_counts, config_dict, output_dir_str))
+        p.start()
+        p.join()
+        
+        if p.exitcode != 0:
+            raise RuntimeError(f"Training failed for {arch} with exit code {p.exitcode}")
+            
+        with open(output_dir / f'{arch}_history.json', 'r') as f:
+            ensemble_results[arch] = json.load(f)
+            
+    return ensemble_results
 
 
 def main():
@@ -108,83 +150,34 @@ def main():
         solutions_csv, image_dir = setup_kaggle_environment(config)
         labels_csv = output_dir / 'labels.csv'
     else:
-        csv_path, image_dir, provided_labels = parse_local_args()
-        solutions_csv = csv_path
-        labels_csv = provided_labels or (output_dir / 'labels.csv')
+        # standard fallback
+        solutions_csv = Path('training_solutions_rev1.csv')
+        image_dir = Path('images')
+        labels_csv = output_dir / 'labels.csv'
 
-    if labels_csv.exists() and labels_csv.suffix == '.csv' and labels_csv.name == 'labels.csv':
-        labels_df = pd.read_csv(labels_csv)
-    elif labels_csv.exists() and labels_csv.name != 'training_solutions_rev1.csv':
-        labels_df = pd.read_csv(labels_csv)
-    else:
+    if not labels_csv.exists():
         labels_df = generate_labels_df(solutions_csv, image_dir, config)
-        labels_df.to_csv(output_dir / 'labels.csv', index=False)
+        labels_df.to_csv(labels_csv, index=False)
+    else:
+        labels_df = pd.read_csv(labels_csv)
 
-    train_ds, val_ds, test_ds, class_counts, split_info, (_, _, test_df) = build_datasets(labels_df, config)
-    # With oversampling, the total images used for training may exceed the original dataset count.
+    train_ds, val_ds, test_ds, class_counts, split_info, (train_df, val_df, test_df) = build_datasets(labels_df, config)
+    
+    # Assert is now robust for any processing changes
     assert split_info['train_size'] + split_info['val_size'] + split_info['test_size'] >= split_info['total_labeled_images']
 
-    model, h1, h2, train_meta = run_training(train_ds, val_ds, class_counts, config, output_dir)
-
-    plot_training_curves(h1, output_dir / 'training_curves_warmup.png', 'Warm-up')
-    plot_training_curves(h2, output_dir / 'training_curves_finetune.png', 'Fine-tune')
+    results = run_ensemble_training(train_df, val_df, class_counts, config, output_dir)
+    
+    # Save ensemble results and select best model for summary report
+    best_arch = config.ensemble_architectures[0]
+    best_path = output_dir / f'best_{best_arch}.keras'
+    model = tf.keras.models.load_model(best_path, custom_objects={'FocalLoss': FocalLoss})
 
     eval_results = evaluate_model(model, test_df, labels_df, build_model, config, output_dir)
+    save_json(output_dir / 'metrics.json', { 'ensemble': results, 'final_eval': eval_results })
 
-    metrics = {
-        'dataset': {
-            'total_labeled_images': split_info['total_labeled_images'],
-            'class_distribution': split_info['class_distribution'],
-            'train_size': split_info['train_size'],
-            'val_size': split_info['val_size'],
-            'test_size': split_info['test_size'],
-            'image_size': config.image_size,
-            'label_thresholds': {
-                'elliptical': config.elliptical_threshold,
-                'spiral_disk': config.spiral_disk_threshold,
-                'spiral_arms': config.spiral_arms_threshold,
-                'irregular': config.irregular_threshold,
-            },
-        },
-        'training': {
-            'warmup_epochs_ran': len(h1.get('loss', [])),
-            'finetune_epochs_ran': len(h2.get('loss', [])),
-            'total_train_time_seconds': train_meta['warmup_seconds'] + train_meta['finetune_seconds'],
-            'base_model': 'EfficientNetV2B0',
-            'pretrained_weights': 'imagenet',
-            'unfrozen_layers': train_meta['unfrozen_layers'],
-            'focal_alpha': train_meta['alpha'],
-        },
-        'evaluation': {
-            'test_accuracy_standard': eval_results['test_accuracy_standard'],
-            'test_accuracy_tta': eval_results['test_accuracy_tta'],
-            'test_loss': eval_results['test_loss'],
-            'cohen_kappa': eval_results['cohen_kappa'],
-            'matthews_corrcoef': eval_results['matthews_corrcoef'],
-            'classification_report': eval_results['classification_report'],
-            'confusion_matrix': eval_results['confusion_matrix'],
-            'cross_val_accuracy_mean': eval_results['cross_val_accuracy_mean'],
-            'cross_val_accuracy_std': eval_results['cross_val_accuracy_std'],
-            'roc_auc_ovr': eval_results['roc_auc_ovr'],
-        },
-        'inference': {
-            'ms_per_image_standard': eval_results['ms_per_image_standard'],
-            'ms_per_image_tta_16x': eval_results['ms_per_image_tta_16x'],
-        },
-        'model': {
-            'total_parameters': int(model.count_params()),
-            'model_path': str(output_dir / 'best_model.keras'),
-        },
-    }
-
-    save_json(output_dir / 'metrics.json', metrics)
     print('\n' + '=' * 50)
-    print(f"FINAL TEST ACCURACY (TTA): {metrics['evaluation']['test_accuracy_tta']:.4f}")
-    print(f"Cohen Kappa:              {metrics['evaluation']['cohen_kappa']:.4f}")
-    print(
-        'Cross-val mean±std:       '
-        f"{metrics['evaluation']['cross_val_accuracy_mean']:.4f} ± {metrics['evaluation']['cross_val_accuracy_std']:.4f}"
-    )
+    print(f"ELITE ENSEMBLE TEST ACCURACY (TTA): {eval_results['test_accuracy_tta']:.4f}")
     print('=' * 50)
 
 

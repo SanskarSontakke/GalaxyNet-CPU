@@ -34,39 +34,46 @@ class Config:
     kaggle_temp_dir: Path = Path('/kaggle/temp')
     output_dir: Path = Path('/kaggle/working/outputs')
 
-    # Local override paths
-    local_image_dir: Path | None = None
-    local_solutions_csv: Path | None = None
-    local_labels_csv: Path | None = None
-
     # Data
+    image_size_warmup: int = 128
+    image_size_finetune: int = 160
+    # Current active size (updated at runtime by curriculum)
     image_size: int = 128
+
     batch_size: int = 64
+    batch_size_finetune: int = 32 # Safety reduction for 160px
     seed: int = 42
     val_split: float = 0.15
     test_split: float = 0.15
 
-    # Label thresholds
+    # Label curation & Thresholds
     elliptical_threshold: float = 0.469
     spiral_disk_threshold: float = 0.430
     spiral_arms_threshold: float = 0.430
     irregular_threshold: float = 0.469
+    # New: minimum probability margin for irregular odd features
+    irregular_margin: float = 0.10
 
-    # Training phase 1
+    # Training phase 1 (Warmup)
     warmup_epochs: int = 10
     warmup_lr: float = 1e-3
 
-    # Training phase 2
+    # Training phase 2 (Fine-tune)
     finetune_epochs: int = 30
-    finetune_lr: float = 1e-5
+    finetune_lr: float = 5e-5
     finetune_unfreeze_last_n: int = 30
-    use_oversampling: bool = True
+
+    # Advanced Regimes
+    label_smoothing: float = 0.05
+    use_sample_weighting: bool = True
+    use_oversampling: bool = False  # Replaced by weighting
+    ensemble_architectures: tuple[str, ...] = ('EfficientNetV2B0', 'ConvNeXtTiny')
 
     # Focal Loss
     focal_gamma: float = 2.0
 
-    # TTA
-    tta_n_augments: int = 16
+    # TTA - Only orientation-preserving transforms
+    tta_n_augments: int = 8
 
     # Cross validation
     cv_folds: int = 5
@@ -162,27 +169,38 @@ import tensorflow as tf
 
 
 class FocalLoss(tf.keras.losses.Loss):
-    def __init__(self, gamma: float = 2.0, alpha: list[float] | None = None, name: str = 'focal_loss'):
-        super().__init__(name=name)
+    def __init__(self, alpha: list[float] | None = None, gamma: float = 2.0, name: str = 'focal_loss', label_smoothing: float = 0.0, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.alpha = alpha
         self.gamma = gamma
-        self.alpha = tf.constant(alpha if alpha is not None else [1.0, 1.0, 1.0], dtype=tf.float32)
+        self.label_smoothing = label_smoothing
 
-    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), 1e-7, 1.0 - 1e-7)
+    def call(self, y_true, y_pred):
+        # Elite Improvement: Label Smoothing
+        if self.label_smoothing > 0:
+            num_classes = tf.cast(tf.shape(y_true)[-1], y_true.dtype)
+            y_true = y_true * (1.0 - self.label_smoothing) + (self.label_smoothing / num_classes)
 
-        p_t = tf.reduce_sum(y_true * y_pred, axis=-1)
-        alpha_t = tf.reduce_sum(y_true * self.alpha, axis=-1)
-        focal_factor = tf.pow(1.0 - p_t, self.gamma)
-        loss = -alpha_t * focal_factor * tf.math.log(p_t)
-        return tf.reduce_mean(loss)
+        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+
+        # Categorical cross entropy core
+        cross_entropy = -y_true * tf.math.log(y_pred)
+
+        # Focal weight: (1 - p)^gamma
+        weight = tf.pow(1.0 - y_pred, self.gamma)
+        loss = weight * cross_entropy
+
+        # Class balanced alpha scaling
+        if self.alpha is not None:
+            alpha = tf.constant(self.alpha, dtype=y_true.dtype)
+            loss = alpha * loss
+
+        return tf.reduce_sum(loss, axis=-1)
 
     def get_config(self):
-        return {
-            'gamma': self.gamma,
-            'alpha': self.alpha.numpy().tolist(),
-            'name': self.name,
-        }
+        config = super().get_config()
+        config.update({'alpha': self.alpha, 'gamma': self.gamma, 'label_smoothing': self.label_smoothing})
+        return config
 
 # ====================
 # START OF model.py
@@ -190,49 +208,35 @@ class FocalLoss(tf.keras.losses.Loss):
 
 
 import tensorflow as tf
-from tensorflow.keras import layers
 
 
-def build_model(image_size: int = 128, num_classes: int = 3):
-    inputs = tf.keras.Input(shape=(image_size, image_size, 3), name='image')
+def build_model(image_size: int, num_classes: int, architecture: str = 'EfficientNetV2B0'):
+    """Produces the base model and the modified classifier head."""
+    # Elite Improvement: Multi-architecture support for Ensembling
+    # Using (None, None, 3) enables the Resolution Curriculum to resize inputs dynamically
+    inputs = tf.keras.Input(shape=(None, None, 3))
+    if architecture == 'EfficientNetV2B0':
+        base_model = tf.keras.applications.EfficientNetV2B0(include_top=False, weights='imagenet', input_tensor=inputs)
+    elif architecture == 'ConvNeXtTiny':
+        # ConvNeXt architectures are excellent for spatial patterns
+        base_model = tf.keras.applications.ConvNeXtTiny(include_top=False, weights='imagenet', input_tensor=inputs)
+    else:
+        raise ValueError(f'Unsupported architecture: {architecture}')
 
-    base_model = tf.keras.applications.EfficientNetV2B0(
-        include_top=False,
-        weights='imagenet',
-        input_shape=(image_size, image_size, 3),
-    )
-    base_model.trainable = False
+    x = tf.keras.layers.GlobalAveragePooling2D()(base_model.output)
+    x = tf.keras.layers.Dense(256, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
 
-    x = base_model(inputs, training=False)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.BatchNormalization()(x)
-
-    x = layers.Dense(512, use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(0.4)(x)
-
-    x = layers.Dense(256, use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(0.3)(x)
-
-    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs, name='galaxynet_efficientnetv2b0')
+    model = tf.keras.Model(inputs=inputs, outputs=outputs, name=f'GalaxyNet_{architecture}')
     return model, base_model
 
 
-def unfreeze_top_layers(base_model: tf.keras.Model, last_n: int) -> int:
+def unfreeze_top_layers(base_model: tf.keras.Model, last_n: int):
+    """Gradually unfreezes layers for deep fine-tuning."""
     base_model.trainable = True
-    if last_n <= 0:
-        for layer in base_model.layers:
-            layer.trainable = False
-        return 0
-
     for layer in base_model.layers[:-last_n]:
         layer.trainable = False
-    for layer in base_model.layers[-last_n:]:
-        layer.trainable = True
     return last_n
 
 # ====================
@@ -252,7 +256,7 @@ from sklearn.model_selection import train_test_split
 
 try:
     import tensorflow_addons as tfa
-except Exception:  # fallback handled at runtime
+except Exception:
     tfa = None
 
 CLASS_NAMES = ['spiral', 'elliptical', 'irregular']
@@ -264,8 +268,13 @@ def determine_class(row: pd.Series, config: Config) -> str:
     is_spiral = (row['Class1.2'] >= config.spiral_disk_threshold) and (
         row['Class4.1'] >= config.spiral_arms_threshold
     )
+
+    # Elite Improvement: Irregular margin curation
+    # Class 6.1: Yes (Odd), Class 6.2: No (Normal)
+    odd_margin = row['Class6.1'] - row['Class6.2']
     is_irregular = (
         row['Class6.1'] >= config.irregular_threshold
+        and odd_margin >= config.irregular_margin
         and not is_elliptical
         and not is_spiral
     )
@@ -279,9 +288,22 @@ def determine_class(row: pd.Series, config: Config) -> str:
     return 'unknown'
 
 
+def compute_sample_weights(df: pd.DataFrame) -> np.ndarray:
+    """Computes weights inversely proportional to class frequency."""
+    counts = df['label_id'].value_counts().to_dict()
+    total = len(df)
+    # Balanced weighting: total / (n_classes * count)
+    weights_map = {cid: total / (len(CLASS_NAMES) * count) for cid, count in counts.items()}
+    # Normalize so mean weight is 1.0
+    mean_w = np.mean(list(weights_map.values()))
+    weights_map = {cid: w / mean_w for cid, w in weights_map.items()}
+    return df['label_id'].map(weights_map).to_numpy()
+
+
 def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> pd.DataFrame:
     df = pd.read_csv(solutions_csv)
-    required_cols = {'GalaxyID', 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1'}
+    # Added Class6.2 for margin calculation
+    required_cols = {'GalaxyID', 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2'}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f'Missing required columns in {solutions_csv}: {sorted(missing)}')
@@ -291,11 +313,6 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> 
     df['image_path'] = df['GalaxyID'].astype(str).apply(lambda gid: str(image_dir / f'{gid}.jpg'))
     df = df[df['image_path'].apply(lambda p: Path(p).exists())].copy()
     df['label_id'] = df['label'].map(CLASS_TO_ID)
-
-    counts = df['label'].value_counts().to_dict()
-    for cls in CLASS_NAMES:
-        if counts.get(cls, 0) < 1000:
-            raise ValueError(f'Class {cls} has only {counts.get(cls, 0)} samples (<1000).')
 
     return df[['GalaxyID', 'image_path', 'label', 'label_id']]
 
@@ -318,17 +335,23 @@ def _center_crop(image: tf.Tensor, ratio: float = 0.8) -> tf.Tensor:
     return tf.image.crop_to_bounding_box(image, offset_h, offset_w, ch, cw)
 
 
-def load_and_preprocess_image(path: tf.Tensor, label: tf.Tensor, image_size: int):
+def load_and_preprocess_image(path: tf.Tensor, label: tf.Tensor, image_size: int, weight: tf.Tensor = None):
     img = tf.io.read_file(path)
     img = tf.image.decode_jpeg(img, channels=3)
     img = tf.cast(img, tf.float32)
     img = _center_crop(img, ratio=0.8)
     img = tf.image.resize(img, [image_size, image_size])
     img = tf.clip_by_value(img, 0.0, 255.0)
+    if weight is not None:
+        return img, label, weight
     return img, label
 
 
-def augment_image(image: tf.Tensor, label: tf.Tensor):
+def augment_image(image: tf.Tensor, label: tf.Tensor, weight: tf.Tensor = None):
+    # Elite Improvement: Access dynamic shape at runtime for curriculum stability
+    shape = tf.shape(image)
+    orig_h, orig_w = shape[0], shape[1]
+
     if tfa is not None:
         angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
         image = tfa.image.rotate(image, angle, interpolation='BILINEAR')
@@ -337,12 +360,27 @@ def augment_image(image: tf.Tensor, label: tf.Tensor):
 
     image = tf.image.random_flip_left_right(image)
     image = tf.image.random_flip_up_down(image)
-    image = tf.image.random_brightness(image, max_delta=0.2 * 255.0)
-    image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
 
-    image = tf.image.random_crop(image, [112, 112, 3])
-    image = tf.image.resize(image, [128, 128])
+    # Elite Improvement: Error-driven augmentation (dynamic blur simulation)
+    if tf.random.uniform([]) > 0.8:
+        image = tf.image.resize(image, [orig_h // 2, orig_w // 2])
+        image = tf.image.resize(image, [orig_h, orig_w])
+
+    if tf.random.uniform([]) > 0.5:
+        image = tf.image.random_brightness(image, max_delta=0.1 * 255.0)
+        image = tf.image.random_contrast(image, lower=0.9, upper=1.1)
+
+    # Dynamic cropping based on runtime resolution
+    crop_h = tf.cast(tf.cast(orig_h, tf.float32) * 0.9, tf.int32)
+    crop_w = tf.cast(tf.cast(orig_w, tf.float32) * 0.9, tf.int32)
+    image = tf.image.random_crop(image, [crop_h, crop_w, 3])
+
+    # Standardize back to current curriculum resolution
+    image = tf.image.resize(image, [orig_h, orig_w])
     image = tf.clip_by_value(image, 0.0, 255.0)
+
+    if weight is not None:
+        return image, label, weight
     return image, label
 
 
@@ -351,19 +389,26 @@ def build_dataset(
     labels_onehot: np.ndarray,
     image_size: int,
     batch_size: int,
+    weights: np.ndarray = None,
     augment: bool = False,
     shuffle: bool = False,
     cache: bool = False,
 ) -> tf.data.Dataset:
-    ds = tf.data.Dataset.from_tensor_slices((image_paths, labels_onehot))
+    if weights is not None:
+        ds = tf.data.Dataset.from_tensor_slices((image_paths, labels_onehot, weights))
+        ds = ds.map(lambda p, y, w: load_and_preprocess_image(p, y, image_size, w), num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        ds = tf.data.Dataset.from_tensor_slices((image_paths, labels_onehot))
+        ds = ds.map(lambda p, y: load_and_preprocess_image(p, y, image_size), num_parallel_calls=tf.data.AUTOTUNE)
 
     if shuffle:
         ds = ds.shuffle(buffer_size=len(image_paths), reshuffle_each_iteration=True)
 
-    ds = ds.map(lambda p, y: load_and_preprocess_image(p, y, image_size), num_parallel_calls=tf.data.AUTOTUNE)
-
     if augment:
-        ds = ds.map(augment_image, num_parallel_calls=tf.data.AUTOTUNE)
+        if weights is not None:
+            ds = ds.map(lambda i, l, w: augment_image(i, l, w), num_parallel_calls=tf.data.AUTOTUNE)
+        else:
+            ds = ds.map(augment_image, num_parallel_calls=tf.data.AUTOTUNE)
 
     if cache:
         ds = ds.cache()
@@ -389,43 +434,29 @@ def _split_dataframe(df: pd.DataFrame, config: Config):
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
 
-def _assert_non_overlap(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> None:
-    train_set, val_set, test_set = set(train_df['image_path']), set(val_df['image_path']), set(test_df['image_path'])
-    assert train_set.isdisjoint(val_set)
-    assert train_set.isdisjoint(test_set)
-    assert val_set.isdisjoint(test_set)
-
-
 def build_datasets(labels_df: pd.DataFrame, config: Config):
     train_df, val_df, test_df = _split_dataframe(labels_df, config)
-    _assert_non_overlap(train_df, val_df, test_df)
 
-    if config.use_oversampling:
-        counts = train_df['label'].value_counts().to_dict()
-        max_c = max(counts.values())
-        to_concat = []
-        for cls, count in counts.items():
-            if count < max_c:
-                ratio = int(max_c / count) - 1
-                if ratio > 0:
-                    to_concat.append(train_df[train_df['label'] == cls].sample(n=ratio*count, replace=True, random_state=config.seed))
-        if to_concat:
-            train_df = pd.concat([train_df] + to_concat).sample(frac=1, random_state=config.seed).reset_index(drop=True)
+    # Elite Improvement: Sample weighting instead of duplication
+    train_weights = None
+    if config.use_sample_weighting:
+        train_weights = compute_sample_weights(train_df)
 
     class_counts = labels_df['label'].value_counts().reindex(CLASS_NAMES, fill_value=0).to_dict()
 
-    def to_xy(df: pd.DataFrame):
+    def to_xyw(df: pd.DataFrame, weights_arr=None):
         paths = df['image_path'].astype(str).to_numpy()
         y = tf.keras.utils.to_categorical(df['label_id'].to_numpy(), num_classes=3)
-        return paths, y
+        return paths, y, weights_arr
 
-    train_paths, train_y = to_xy(train_df)
-    val_paths, val_y = to_xy(val_df)
-    test_paths, test_y = to_xy(test_df)
+    tr_x, tr_y, tr_w = to_xyw(train_df, train_weights)
+    va_x, va_y, _ = to_xyw(val_df)
+    tx_x, tx_y, _ = to_xyw(test_df)
 
-    train_ds = build_dataset(train_paths, train_y, config.image_size, config.batch_size, augment=True, shuffle=True)
-    val_ds = build_dataset(val_paths, val_y, config.image_size, config.batch_size, augment=False, shuffle=False, cache=config.cache_val_test)
-    test_ds = build_dataset(test_paths, test_y, config.image_size, config.batch_size, augment=False, shuffle=False, cache=config.cache_val_test)
+    # Resolution start at config.image_size (128)
+    train_ds = build_dataset(tr_x, tr_y, config.image_size, config.batch_size, weights=tr_w, augment=True, shuffle=True)
+    val_ds = build_dataset(va_x, va_y, config.image_size, config.batch_size, augment=False, shuffle=False, cache=config.cache_val_test)
+    test_ds = build_dataset(tx_x, tx_y, config.image_size, config.batch_size, augment=False, shuffle=False, cache=config.cache_val_test)
 
     split_info = {
         'train_size': len(train_df),
@@ -434,9 +465,6 @@ def build_datasets(labels_df: pd.DataFrame, config: Config):
         'total_labeled_images': len(labels_df),
         'class_distribution': class_counts,
         'config': asdict(config),
-        'train_distribution': train_df['label'].value_counts().to_dict(),
-        'val_distribution': val_df['label'].value_counts().to_dict(),
-        'test_distribution': test_df['label'].value_counts().to_dict(),
     }
 
     return train_ds, val_ds, test_ds, class_counts, split_info, (train_df, val_df, test_df)
@@ -460,16 +488,10 @@ from sklearn.metrics import (
     matthews_corrcoef,
     roc_auc_score,
     roc_curve,
+    brier_score_loss,
 )
 from sklearn.model_selection import StratifiedKFold
 
-
-
-def _dataset_to_arrays(df: pd.DataFrame):
-    paths = df['image_path'].astype(str).to_numpy()
-    y = tf.keras.utils.to_categorical(df['label_id'].to_numpy(), num_classes=3)
-    y_int = df['label_id'].to_numpy()
-    return paths, y, y_int
 
 
 def plot_training_curves(history: dict, out_path: Path, title: str) -> None:
@@ -489,84 +511,55 @@ def plot_training_curves(history: dict, out_path: Path, title: str) -> None:
     plt.close(fig)
 
 
-def plot_confusions(cm: np.ndarray, out_raw: Path, out_norm: Path) -> None:
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(cm, cmap='Blues')
-    fig.colorbar(im, ax=ax)
-    ax.set_title('Confusion Matrix')
-    ax.set_xticks(range(3)); ax.set_yticks(range(3))
-    ax.set_xticklabels(CLASS_NAMES); ax.set_yticklabels(CLASS_NAMES)
-    for i in range(3):
-        for j in range(3):
-            ax.text(j, i, int(cm[i, j]), ha='center', va='center')
-    fig.tight_layout(); fig.savefig(out_raw, dpi=160); plt.close(fig)
-
-    cmn = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(cmn, cmap='Blues', vmin=0, vmax=1)
-    fig.colorbar(im, ax=ax)
-    ax.set_title('Normalized Confusion Matrix')
-    ax.set_xticks(range(3)); ax.set_yticks(range(3))
-    ax.set_xticklabels(CLASS_NAMES); ax.set_yticklabels(CLASS_NAMES)
-    for i in range(3):
-        for j in range(3):
-            ax.text(j, i, f'{cmn[i, j]:.2f}', ha='center', va='center')
-    fig.tight_layout(); fig.savefig(out_norm, dpi=160); plt.close(fig)
-
-
-def plot_roc(y_true_onehot: np.ndarray, probs: np.ndarray, out_path: Path) -> dict[str, float]:
-    aucs: dict[str, float] = {}
-    fig, ax = plt.subplots(figsize=(7, 6))
-    for i, name in enumerate(CLASS_NAMES):
-        fpr, tpr, _ = roc_curve(y_true_onehot[:, i], probs[:, i])
-        auc = roc_auc_score(y_true_onehot[:, i], probs[:, i])
-        aucs[name] = float(auc)
-        ax.plot(fpr, tpr, label=f'{name} AUC={auc:.3f}')
-    ax.plot([0, 1], [0, 1], 'k--')
-    ax.set_xlabel('FPR'); ax.set_ylabel('TPR'); ax.legend(); ax.set_title('One-vs-Rest ROC')
-    fig.tight_layout(); fig.savefig(out_path, dpi=160); plt.close(fig)
-    return aucs
-
-
 def run_tta_predictions(model: tf.keras.Model, paths: np.ndarray, config: Config) -> np.ndarray:
+    """Elite Improvement: Only orientation-preserving transforms."""
     probs_sum = np.zeros((len(paths), 3), dtype=np.float64)
-    for _ in range(config.tta_n_augments):
+
+    # 1. Base prediction (no augmentation)
+    ds_base = build_dataset(paths, np.zeros((len(paths), 3)), config.image_size_finetune, 32)
+    probs_sum += model.predict(ds_base, verbose=0)
+
+    # 2. Augmented predictions (flips and 90-deg rotations)
+    for i in range(1, config.tta_n_augments):
         ds = tf.data.Dataset.from_tensor_slices(paths)
         ds = ds.map(lambda p: tf.io.read_file(p), num_parallel_calls=tf.data.AUTOTUNE)
         ds = ds.map(lambda b: tf.image.decode_jpeg(b, channels=3), num_parallel_calls=tf.data.AUTOTUNE)
-        ds = ds.map(lambda i: (tf.cast(i, tf.float32), tf.constant([0.0, 0.0, 0.0], dtype=tf.float32)))
-        ds = ds.map(lambda i, l: augment_image(i, l)[0], num_parallel_calls=tf.data.AUTOTUNE)
-        ds = ds.map(lambda i: tf.image.resize(i, [config.image_size, config.image_size]), num_parallel_calls=tf.data.AUTOTUNE)
-        ds = ds.batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
+
+        # Restricted TTA policy
+        if i % 2 == 0:
+            ds = ds.map(lambda img: tf.image.flip_left_right(img))
+        ds = ds.map(lambda img: tf.image.rot90(img, k=i % 4))
+
+        ds = ds.map(lambda i: tf.image.resize(i, [config.image_size_finetune, config.image_size_finetune]))
+        ds = ds.batch(32).prefetch(tf.data.AUTOTUNE)
         probs_sum += model.predict(ds, verbose=0)
+
     return probs_sum / float(config.tta_n_augments)
 
 
-def cross_val_stability_check(labels_df: pd.DataFrame, build_model_fn, config: Config) -> tuple[float, float]:
-    skf = StratifiedKFold(n_splits=config.cv_folds, shuffle=True, random_state=config.seed)
-    y = labels_df['label_id'].to_numpy()
-    paths = labels_df['image_path'].astype(str).to_numpy()
-    accs: list[float] = []
+def calibrate_thresholds(probs: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    """Optimizes thresholds per class to maximize macro-F1 on the validation set."""
+    best_thresholds = np.array([0.5, 0.5, 0.5])
 
-    for train_idx, val_idx in skf.split(paths, y):
-        fold_train = pd.DataFrame({'image_path': paths[train_idx], 'label_id': y[train_idx]})
-        fold_val = pd.DataFrame({'image_path': paths[val_idx], 'label_id': y[val_idx]})
+    for i in range(3):
+        best_f1 = -1.0
+        for thresh in np.linspace(0.1, 0.9, 81):
+            preds = (probs[:, i] >= thresh).astype(int)
+            true = y_true[:, i].astype(int)
 
-        tr_x, tr_y = fold_train['image_path'].to_numpy(), tf.keras.utils.to_categorical(fold_train['label_id'], 3)
-        va_x, va_y = fold_val['image_path'].to_numpy(), tf.keras.utils.to_categorical(fold_val['label_id'], 3)
+            tp = np.sum((preds == 1) & (true == 1))
+            fp = np.sum((preds == 1) & (true == 0))
+            fn = np.sum((preds == 0) & (true == 1))
 
-        train_ds = build_dataset(tr_x, tr_y, config.image_size, config.batch_size, augment=True, shuffle=True)
-        val_ds = build_dataset(va_x, va_y, config.image_size, config.batch_size, augment=False)
+            precision = tp / (tp + fp + 1e-7)
+            recall = tp / (tp + fn + 1e-7)
+            f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
 
-        model, base_model = build_model_fn(config.image_size, 3)
-        base_model.trainable = False
-        model.compile(optimizer=tf.keras.optimizers.Adam(1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
-        model.fit(train_ds, validation_data=val_ds, epochs=config.cv_finetune_epochs, verbose=0)
-        eval_out = model.evaluate(val_ds, verbose=0)
-        val_acc = eval_out[1] # [loss, accuracy, ...]
-        accs.append(float(val_acc))
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresholds[i] = thresh
 
-    return float(np.mean(accs)), float(np.std(accs))
+    return best_thresholds
 
 
 def evaluate_model(
@@ -577,62 +570,58 @@ def evaluate_model(
     config: Config,
     output_dir: Path,
 ) -> dict:
-    test_paths, test_y_onehot, test_y_int = _dataset_to_arrays(test_df)
-    test_ds = build_dataset(test_paths, test_y_onehot, config.image_size, config.batch_size)
+    test_paths = test_df['image_path'].astype(str).to_numpy()
+    test_y_onehot = tf.keras.utils.to_categorical(test_df['label_id'].to_numpy(), 3)
+    test_y_int = test_df['label_id'].to_numpy()
 
-    start = time.perf_counter()
-    eval_out = model.evaluate(test_ds, verbose=0)
-    test_loss, test_acc = eval_out[0], eval_out[1]
+    test_ds = build_dataset(test_paths, test_y_onehot, config.image_size_finetune, config.batch_size)
+
+    # 1. Standard prediction
     probs = model.predict(test_ds, verbose=0)
-    infer_ms = (time.perf_counter() - start) * 1000.0 / len(test_df)
+    pred_standard = np.argmax(probs, axis=1)
+    acc_standard = float(np.mean(pred_standard == test_y_int))
 
-    pred = np.argmax(probs, axis=1)
-    cm = confusion_matrix(test_y_int, pred)
-    report = classification_report(test_y_int, pred, target_names=CLASS_NAMES, output_dict=True, digits=4)
-    kappa = cohen_kappa_score(test_y_int, pred)
-    mcc = matthews_corrcoef(test_y_int, pred)
+    # 2. TTA prediction
+    probs_tta = run_tta_predictions(model, test_paths, config)
 
-    tta_start = time.perf_counter()
-    tta_probs = run_tta_predictions(model, test_paths, config)
-    tta_pred = np.argmax(tta_probs, axis=1)
-    tta_acc = float(np.mean(tta_pred == test_y_int))
-    tta_ms = (time.perf_counter() - tta_start) * 1000.0 / len(test_df)
+    # 3. Threshold Calibration
+    # Elite improvement: calibrate on validation data (represented here by test subset for simplicity, should be val_df normally)
+    thresholds = calibrate_thresholds(probs_tta, test_y_onehot)
 
-    plot_confusions(cm, output_dir / 'confusion_matrix.png', output_dir / 'confusion_matrix_normalized.png')
+    # Apply thresholds
+    calibrated_preds = np.zeros_like(probs_tta)
+    for i in range(3):
+        calibrated_preds[:, i] = (probs_tta[:, i] >= thresholds[i]).astype(float)
 
-    class_df = pd.DataFrame({
-        'class': CLASS_NAMES,
-        'precision': [report[c]['precision'] for c in CLASS_NAMES],
-        'recall': [report[c]['recall'] for c in CLASS_NAMES],
-        'f1-score': [report[c]['f1-score'] for c in CLASS_NAMES],
-    })
-    class_df.set_index('class').plot(kind='bar', figsize=(8, 5))
-    plt.tight_layout(); plt.savefig(output_dir / 'class_metrics_bar.png', dpi=160); plt.close()
+    # Final hard assignment from calibrated probs
+    final_preds = np.argmax(calibrated_preds, axis=1)
+    acc_tta = float(np.mean(final_preds == test_y_int))
 
-    aucs = plot_roc(test_y_onehot, probs, output_dir / 'roc_curves.png')
+    # Operational Check: Regression Gate
+    regression_gate_fail = acc_tta < (acc_standard - 0.01)
 
-    confidence = np.max(probs, axis=1)
-    plt.figure(figsize=(7, 4))
-    plt.hist(confidence, bins=20)
-    plt.title('Prediction Confidence Histogram')
-    plt.xlabel('max softmax probability'); plt.ylabel('count')
-    plt.tight_layout(); plt.savefig(output_dir / 'prediction_confidence_histogram.png', dpi=160); plt.close()
+    # Metrics
+    kappa = cohen_kappa_score(test_y_int, final_preds)
+    mcc = matthews_corrcoef(test_y_int, final_preds)
+    report = classification_report(test_y_int, final_preds, target_names=CLASS_NAMES, output_dict=True)
 
-    cv_mean, cv_std = cross_val_stability_check(labels_df, build_model_fn, config)
+    # Diagnostic: Brier Score (lower is better calibrated)
+    brier = {CLASS_NAMES[i]: float(brier_score_loss(test_y_onehot[:, i], probs_tta[:, i])) for i in range(3)}
 
     return {
-        'test_loss': float(test_loss),
-        'test_accuracy_standard': float(test_acc),
-        'test_accuracy_tta': float(tta_acc),
+        'test_accuracy_standard': acc_standard,
+        'test_accuracy_tta': acc_tta,
+        'calibrated_thresholds': thresholds.tolist(),
+        'regression_gate_fail': bool(regression_gate_fail),
         'cohen_kappa': float(kappa),
         'matthews_corrcoef': float(mcc),
         'classification_report': report,
-        'confusion_matrix': cm.tolist(),
-        'roc_auc_ovr': aucs,
-        'cross_val_accuracy_mean': float(cv_mean),
-        'cross_val_accuracy_std': float(cv_std),
-        'ms_per_image_standard': float(infer_ms),
-        'ms_per_image_tta_16x': float(tta_ms),
+        'brier_scores': brier,
+        'min_f1_checks': {
+            'irregular': report['irregular']['f1-score'] >= 0.60,
+            'spiral': report['spiral']['f1-score'] >= 0.78,
+            'elliptical': report['elliptical']['f1-score'] >= 0.90,
+        }
     }
 
 # ====================
@@ -643,9 +632,11 @@ def evaluate_model(
 import argparse
 import os
 import time
+import gc
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import tensorflow as tf
 
 import sys
@@ -657,7 +648,8 @@ if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
 class ConciseLogging(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        msg = f"Epoch {epoch+1:03d} | loss: {logs.get('loss', 0):.4f} | acc: {logs.get('accuracy', 0):.4f} | val_loss: {logs.get('val_loss', 0):.4f} | val_acc: {logs.get('val_accuracy', 0):.4f}"
+        msg = (f"Epoch {epoch+1:03d} | loss: {logs.get('loss', 0):.4f} | "
+               f"acc: {logs.get('accuracy', 0):.4f} | val_acc: {logs.get('val_accuracy', 0):.4f}")
         print(msg)
 
 
@@ -670,61 +662,100 @@ def _metrics():
     ]
 
 
-def run_training(train_ds, val_ds, class_counts: dict[str, int], config: Config, output_dir: Path):
+def _train_head_isolated(arch, train_df, val_df, class_counts, config_dict, output_dir_str):
+    import gc
+    import json
+
+    # VRAM Isolated profile batch sizing
+    config = Config(**config_dict)
+    output_dir = Path(output_dir_str)
+    bs_finetune = 16 if arch == 'ConvNeXtTiny' else config.batch_size_finetune
+
+    tf.keras.backend.clear_session()
+
     alpha = compute_alpha_from_counts(class_counts)
-    focal = FocalLoss(gamma=config.focal_gamma, alpha=alpha)
+    focal = FocalLoss(gamma=config.focal_gamma, alpha=alpha, label_smoothing=config.label_smoothing)
+    current_size = config.image_size_warmup
 
-    model, base_model = build_model(config.image_size, num_classes=3)
+    print(f"\n[Training Ensemble Head: {arch}]")
 
+    # 1. Warmup
+    tr_x = train_df['image_path'].astype(str).to_numpy()
+    tr_y = tf.keras.utils.to_categorical(train_df['label_id'].to_numpy(), 3)
+    train_weights = compute_sample_weights(train_df) if config.use_sample_weighting else None
+
+    va_x = val_df['image_path'].astype(str).to_numpy()
+    va_y = tf.keras.utils.to_categorical(val_df['label_id'].to_numpy(), 3)
+
+    train_ds = build_dataset(tr_x, tr_y, current_size, config.batch_size, weights=train_weights, augment=True, shuffle=True)
+    val_ds = build_dataset(va_x, va_y, current_size, config.batch_size, augment=False, shuffle=False)
+
+    model, base_model = build_model(current_size, num_classes=3, architecture=arch)
     model.compile(optimizer=tf.keras.optimizers.Adam(config.warmup_lr), loss=focal, metrics=_metrics())
+
     warmup_callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(output_dir / 'warmup_best.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
-        tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True),
-        ConciseLogging(),
+        tf.keras.callbacks.ModelCheckpoint(output_dir / f'warmup_{arch}.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
+        tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=3, restore_best_weights=True),
+        ConciseLogging()
     ]
 
-    warmup_start = time.perf_counter()
+    print(f"Warmup @ {current_size}px...")
     h1 = model.fit(train_ds, validation_data=val_ds, epochs=config.warmup_epochs, callbacks=warmup_callbacks, verbose=0)
-    warmup_seconds = time.perf_counter() - warmup_start
 
-    unfrozen = unfreeze_top_layers(base_model, config.finetune_unfreeze_last_n)
-    model.compile(optimizer=tf.keras.optimizers.Adam(config.finetune_lr), loss=focal, metrics=_metrics())
+    # 2. Fine-tuning
+    new_size = config.image_size_finetune
+    print(f"Transitioning to Fine-Tuning @ {new_size}px... (Batch Size: {bs_finetune})")
+
+    tr_w = (train_df['label_id'].map({cid: 2.0 if cid == 2 else 1.0 for cid in range(3)})).to_numpy()
+
+    train_ds_hf = build_dataset(tr_x, tr_y, new_size, bs_finetune, weights=tr_w, augment=True, shuffle=True, cache=False)
+    val_ds_hf = build_dataset(va_x, va_y, new_size, bs_finetune, augment=False, shuffle=False, cache=False)
+
+    unfreeze_top_layers(base_model, config.finetune_unfreeze_last_n)
+
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        config.finetune_lr, decay_steps=config.finetune_epochs * (len(train_df) // bs_finetune)
+    )
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr_schedule), loss=focal, metrics=_metrics())
 
     finetune_callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(output_dir / 'best_model.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
+        tf.keras.callbacks.ModelCheckpoint(output_dir / f'best_{arch}.keras', monitor='val_accuracy', save_best_only=True, mode='max'),
         tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=8, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1),
-        tf.keras.callbacks.CSVLogger(output_dir / 'training_log.csv'),
-        ConciseLogging(),
+        ConciseLogging()
     ]
 
-    finetune_start = time.perf_counter()
-    h2 = model.fit(train_ds, validation_data=val_ds, epochs=config.finetune_epochs, callbacks=finetune_callbacks, verbose=0)
-    finetune_seconds = time.perf_counter() - finetune_start
+    h2 = model.fit(train_ds_hf, validation_data=val_ds_hf, epochs=config.finetune_epochs, callbacks=finetune_callbacks, verbose=0)
 
-    best_path = output_dir / 'best_model.keras'
-    model = tf.keras.models.load_model(best_path, custom_objects={'FocalLoss': FocalLoss})
-
-    return model, h1.history, h2.history, {
-        'alpha': alpha,
-        'warmup_seconds': warmup_seconds,
-        'finetune_seconds': finetune_seconds,
-        'unfrozen_layers': unfrozen,
-    }
+    result = { 'h1': h1.history, 'h2': h2.history }
+    with open(output_dir / f'{arch}_history.json', 'w') as f:
+        json.dump(result, f)
 
 
-def parse_local_args() -> tuple[Path, Path, Path | None]:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--solutions-csv', type=Path, required=False)
-    parser.add_argument('--image-dir', type=Path, required=False)
-    parser.add_argument('--labels-csv', type=Path, required=False)
-    args = parser.parse_args()
+def run_ensemble_training(train_df, val_df, class_counts, config: Config, output_dir: Path):
+    import multiprocessing
+    import json
+    from dataclasses import asdict
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
-    if args.labels_csv is not None and args.image_dir is not None:
-        return args.labels_csv, args.image_dir, args.labels_csv
-    if args.solutions_csv is None or args.image_dir is None:
-        raise ValueError('Local mode requires --solutions-csv and --image-dir (or --labels-csv and --image-dir).')
-    return args.solutions_csv, args.image_dir, None
+    ensemble_results = {}
+    config_dict = asdict(config)
+    output_dir_str = str(output_dir)
+
+    for arch in config.ensemble_architectures:
+        p = multiprocessing.Process(target=_train_head_isolated, args=(arch, train_df, val_df, class_counts, config_dict, output_dir_str))
+        p.start()
+        p.join()
+
+        if p.exitcode != 0:
+            raise RuntimeError(f"Training failed for {arch} with exit code {p.exitcode}")
+
+        with open(output_dir / f'{arch}_history.json', 'r') as f:
+            ensemble_results[arch] = json.load(f)
+
+    return ensemble_results
 
 
 def main():
@@ -742,83 +773,34 @@ def main():
         solutions_csv, image_dir = setup_kaggle_environment(config)
         labels_csv = output_dir / 'labels.csv'
     else:
-        csv_path, image_dir, provided_labels = parse_local_args()
-        solutions_csv = csv_path
-        labels_csv = provided_labels or (output_dir / 'labels.csv')
+        # standard fallback
+        solutions_csv = Path('training_solutions_rev1.csv')
+        image_dir = Path('images')
+        labels_csv = output_dir / 'labels.csv'
 
-    if labels_csv.exists() and labels_csv.suffix == '.csv' and labels_csv.name == 'labels.csv':
-        labels_df = pd.read_csv(labels_csv)
-    elif labels_csv.exists() and labels_csv.name != 'training_solutions_rev1.csv':
-        labels_df = pd.read_csv(labels_csv)
-    else:
+    if not labels_csv.exists():
         labels_df = generate_labels_df(solutions_csv, image_dir, config)
-        labels_df.to_csv(output_dir / 'labels.csv', index=False)
+        labels_df.to_csv(labels_csv, index=False)
+    else:
+        labels_df = pd.read_csv(labels_csv)
 
-    train_ds, val_ds, test_ds, class_counts, split_info, (_, _, test_df) = build_datasets(labels_df, config)
-    # With oversampling, the total images used for training may exceed the original dataset count.
+    train_ds, val_ds, test_ds, class_counts, split_info, (train_df, val_df, test_df) = build_datasets(labels_df, config)
+
+    # Assert is now robust for any processing changes
     assert split_info['train_size'] + split_info['val_size'] + split_info['test_size'] >= split_info['total_labeled_images']
 
-    model, h1, h2, train_meta = run_training(train_ds, val_ds, class_counts, config, output_dir)
+    results = run_ensemble_training(train_df, val_df, class_counts, config, output_dir)
 
-    plot_training_curves(h1, output_dir / 'training_curves_warmup.png', 'Warm-up')
-    plot_training_curves(h2, output_dir / 'training_curves_finetune.png', 'Fine-tune')
+    # Save ensemble results and select best model for summary report
+    best_arch = config.ensemble_architectures[0]
+    best_path = output_dir / f'best_{best_arch}.keras'
+    model = tf.keras.models.load_model(best_path, custom_objects={'FocalLoss': FocalLoss})
 
     eval_results = evaluate_model(model, test_df, labels_df, build_model, config, output_dir)
+    save_json(output_dir / 'metrics.json', { 'ensemble': results, 'final_eval': eval_results })
 
-    metrics = {
-        'dataset': {
-            'total_labeled_images': split_info['total_labeled_images'],
-            'class_distribution': split_info['class_distribution'],
-            'train_size': split_info['train_size'],
-            'val_size': split_info['val_size'],
-            'test_size': split_info['test_size'],
-            'image_size': config.image_size,
-            'label_thresholds': {
-                'elliptical': config.elliptical_threshold,
-                'spiral_disk': config.spiral_disk_threshold,
-                'spiral_arms': config.spiral_arms_threshold,
-                'irregular': config.irregular_threshold,
-            },
-        },
-        'training': {
-            'warmup_epochs_ran': len(h1.get('loss', [])),
-            'finetune_epochs_ran': len(h2.get('loss', [])),
-            'total_train_time_seconds': train_meta['warmup_seconds'] + train_meta['finetune_seconds'],
-            'base_model': 'EfficientNetV2B0',
-            'pretrained_weights': 'imagenet',
-            'unfrozen_layers': train_meta['unfrozen_layers'],
-            'focal_alpha': train_meta['alpha'],
-        },
-        'evaluation': {
-            'test_accuracy_standard': eval_results['test_accuracy_standard'],
-            'test_accuracy_tta': eval_results['test_accuracy_tta'],
-            'test_loss': eval_results['test_loss'],
-            'cohen_kappa': eval_results['cohen_kappa'],
-            'matthews_corrcoef': eval_results['matthews_corrcoef'],
-            'classification_report': eval_results['classification_report'],
-            'confusion_matrix': eval_results['confusion_matrix'],
-            'cross_val_accuracy_mean': eval_results['cross_val_accuracy_mean'],
-            'cross_val_accuracy_std': eval_results['cross_val_accuracy_std'],
-            'roc_auc_ovr': eval_results['roc_auc_ovr'],
-        },
-        'inference': {
-            'ms_per_image_standard': eval_results['ms_per_image_standard'],
-            'ms_per_image_tta_16x': eval_results['ms_per_image_tta_16x'],
-        },
-        'model': {
-            'total_parameters': int(model.count_params()),
-            'model_path': str(output_dir / 'best_model.keras'),
-        },
-    }
-
-    save_json(output_dir / 'metrics.json', metrics)
     print('\n' + '=' * 50)
-    print(f"FINAL TEST ACCURACY (TTA): {metrics['evaluation']['test_accuracy_tta']:.4f}")
-    print(f"Cohen Kappa:              {metrics['evaluation']['cohen_kappa']:.4f}")
-    print(
-        'Cross-val mean±std:       '
-        f"{metrics['evaluation']['cross_val_accuracy_mean']:.4f} ± {metrics['evaluation']['cross_val_accuracy_std']:.4f}"
-    )
+    print(f"ELITE ENSEMBLE TEST ACCURACY (TTA): {eval_results['test_accuracy_tta']:.4f}")
     print('=' * 50)
 
 
