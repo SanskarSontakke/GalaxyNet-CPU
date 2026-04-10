@@ -1,6 +1,6 @@
 {
   "id": "sanskarsontakke/galaxynet-training",
-  "title": "GalaxyNet Training",
+  "title": "GalaxyNet V25 Cascade Training",
   "code_file": "train_kaggle_bundle.py",
   "language": "python",
   "kernel_type": "script",
