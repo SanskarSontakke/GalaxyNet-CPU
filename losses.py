@@ -3,6 +3,7 @@ from __future__ import annotations
 import tensorflow as tf
 
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
 class BinaryFocalLoss(tf.keras.losses.Loss):
     """Binary focal loss for cascade binary classification stages.
     
@@ -30,9 +31,9 @@ class BinaryFocalLoss(tf.keras.losses.Loss):
         self.label_smoothing = label_smoothing
 
     def call(self, y_true, y_pred):
-        # Ensure float32 for numerical stability (critical for mixed precision)
-        y_true = tf.cast(y_true, tf.float32)
+        # Ensure matching shapes to prevent unintended broadcasting [batch, batch]
         y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(tf.reshape(y_true, tf.shape(y_pred)), tf.float32)
 
         # Label smoothing
         if self.label_smoothing > 0:
@@ -118,6 +119,92 @@ class CategoricalFocalLoss(tf.keras.losses.Loss):
         })
         return config
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class OHEMBinaryLoss(tf.keras.losses.Loss):
+    """Online Hard Example Mining loss for binary classification.
+    
+    Computes per-sample binary cross entropy, then only keeps the top-K%
+    hardest examples (highest loss) for gradient computation. Easy examples
+    that the model already classifies correctly are discarded.
+    
+    This forces the optimizer to spend 100% of its gradient budget on the
+    confusing boundary cases (e.g., ambiguous spiral/irregular galaxies).
+    
+    Args:
+        keep_ratio: Fraction of hardest examples to keep (0.7 = top 70%).
+        label_smoothing: Optional label smoothing factor.
+    """
+
+    def __init__(
+        self,
+        keep_ratio: float = 0.70,
+        label_smoothing: float = 0.0,
+        name: str = 'ohem_binary_loss',
+        **kwargs,
+    ):
+        super().__init__(name=name, reduction='none', **kwargs)
+        self.keep_ratio = keep_ratio
+        self.label_smoothing = label_smoothing
+
+    def call(self, y_true, y_pred):
+        y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(tf.reshape(y_true, tf.shape(y_pred)), tf.float32)
+
+        if self.label_smoothing > 0:
+            y_true = y_true * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+
+        # Per-sample binary cross entropy
+        bce = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+        bce = tf.reduce_mean(bce, axis=-1)  # [batch_size]
+
+        # Keep only the top-K% hardest examples
+        batch_size = tf.shape(bce)[0]
+        k = tf.maximum(tf.cast(tf.cast(batch_size, tf.float32) * self.keep_ratio, tf.int32), 1)
+
+        # Get top-k losses
+        top_k_losses, _ = tf.math.top_k(bce, k=k, sorted=False)
+
+        return tf.reduce_mean(top_k_losses)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'keep_ratio': self.keep_ratio,
+            'label_smoothing': self.label_smoothing,
+        })
+        return config
+
 
 # Backwards compatibility alias
 FocalLoss = CategoricalFocalLoss
+
+# ══════════════════════════════════════════════════════════════
+# CUSTOM METRICS FOR SOFT LABELS
+# ══════════════════════════════════════════════════════════════
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftBinaryAccuracy(tf.keras.metrics.BinaryAccuracy):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftAUC(tf.keras.metrics.AUC):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftPrecision(tf.keras.metrics.Precision):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftRecall(tf.keras.metrics.Recall):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)

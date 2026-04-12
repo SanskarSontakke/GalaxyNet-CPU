@@ -13,10 +13,10 @@ class Config:
     output_dir: Path = Path('/kaggle/working/outputs')
 
     # ── Image resolution curriculum ────────────────────────────
-    image_size_phase1: int = 128   # warmup
-    image_size_phase2: int = 192   # mid-tune
-    image_size_phase3: int = 224   # full fine-tune (UPGRADED from 160)
-    center_crop_ratio: float = 0.75  # tighter crop at higher res
+    image_size_phase1: int = 128
+    image_size_phase2: int = 192
+    image_size_phase3: int = 288   # Upgraded to 288px for final precision
+    center_crop_ratio: float = 0.75
 
     # ── Batch sizes (per phase, tuned for P100 16GB) ───────────
     batch_size_phase1: int = 64    # 128px fits large batches
@@ -36,24 +36,29 @@ class Config:
     irregular_threshold: float = 0.500   # tightened from 0.469
     irregular_margin: float = 0.15       # tightened from 0.10
 
+    # ── Soft Labels (V26) ──────────────────────────────────────
+    use_soft_labels: bool = True    # Regress crowd-sourced voting fractions
+    # When True, Stage 1 label = Class1.1 (P(elliptical)), 
+    # Stage 2 label = normalized spiral confidence
+
     # ── Stage 1 training (elliptical binary) ───────────────────
     stage1_architecture: str = 'EfficientNetV2B1'
-    stage1_warmup_epochs: int = 8
-    stage1_midtune_epochs: int = 8
+    stage1_warmup_epochs: int = 12
+    stage1_midtune_epochs: int = 10
     stage1_finetune_epochs: int = 20
-    stage1_warmup_lr: float = 1e-3
+    stage1_warmup_lr: float = 3e-4
     stage1_midtune_lr: float = 3e-5
     stage1_finetune_lr: float = 8e-6
     stage1_unfreeze_phase2: int = 50  # unfreeze last 50 layers for phase 2
     stage1_unfreeze_phase3: int = 80  # unfreeze last 80 layers for phase 3
 
     # ── Stage 2 training (spiral vs irregular binary) ──────────
-    stage2_architectures: Tuple[str, ...] = ('EfficientNetV2B2', 'EfficientNetV2B1')
-    stage2_seeds: Tuple[int, ...] = (42, 123)
-    stage2_warmup_epochs: int = 8
+    stage2_architectures: Tuple[str, ...] = ('EfficientNetV2B2', 'EfficientNetV2B1', 'ConvNeXtTiny')
+    stage2_seeds: Tuple[int, ...] = (42, 123, 77)
+    stage2_warmup_epochs: int = 12
     stage2_midtune_epochs: int = 10
     stage2_finetune_epochs: int = 25
-    stage2_warmup_lr: float = 1e-3
+    stage2_warmup_lr: float = 3e-4
     stage2_midtune_lr: float = 3e-5
     stage2_finetune_lr: float = 8e-6
     stage2_unfreeze_phase2: int = 50
@@ -62,9 +67,13 @@ class Config:
     stage1_filter_confidence: float = 0.85
 
     # ── Focal loss ─────────────────────────────────────────────
-    stage1_focal_gamma: float = 1.5   # easier boundary
-    stage2_focal_gamma: float = 2.5   # harder boundary
+    stage1_focal_gamma: float = 2.0   # Standard gamma for stable discrimination
+    stage2_focal_gamma: float = 1.5   # moderate focus on hard examples
     label_smoothing: float = 0.05
+
+    # ── OHEM (V26) ─────────────────────────────────────────────
+    ohem_keep_ratio: float = 0.70     # Keep top 70% hardest examples
+    ohem_start_phase: int = 2         # Only enable in Phase 2+ (not warmup)
 
     # ── Augmentation ───────────────────────────────────────────
     mixup_alpha: float = 0.4          # Beta distribution parameter
@@ -72,6 +81,12 @@ class Config:
     cutout_n_holes_irregular: int = 3
     cutout_n_holes_other: int = 1
     cutout_max_size_ratio: float = 0.20
+
+    # ── Astronomy-Specific Augmentations (V26) ─────────────────
+    augment_poisson_scale: float = 25.0   # Poisson noise intensity (higher = less noise)
+    augment_poisson_prob: float = 0.3     # Probability of applying Poisson noise
+    augment_blur_prob: float = 0.2        # Probability of applying PSF blur
+    augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)  # Gaussian blur sigma range
 
     # ── SWA ────────────────────────────────────────────────────
     swa_epochs: int = 5
@@ -84,6 +99,12 @@ class Config:
     # ── Runtime ────────────────────────────────────────────────
     enable_mixed_precision: bool = True
     use_sample_weighting: bool = True
+
+    # ── XGBoost Stacking (V26) ─────────────────────────────────
+    use_xgboost_stacking: bool = True
+    xgb_n_estimators: int = 300
+    xgb_max_depth: int = 6
+    xgb_learning_rate: float = 0.05
 
     # ── Minimum class counts after threshold tightening ────────
     min_irregular_count: int = 3000

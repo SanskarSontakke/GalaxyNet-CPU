@@ -100,14 +100,18 @@ def unfreeze_top_layers(base_model: tf.keras.Model, last_n: int) -> int:
     """Gradually unfreezes the last N layers of the base model for fine-tuning.
     
     All layers before the last N are frozen (not trainable).
-    Returns the number of unfrozen layers.
+    Returns the number of unfrozen layers (those with trainable weights).
     """
     base_model.trainable = True
     total_layers = len(base_model.layers)
     freeze_up_to = max(0, total_layers - last_n)
     for layer in base_model.layers[:freeze_up_to]:
         layer.trainable = False
-    unfrozen = sum(1 for l in base_model.layers if l.trainable)
+    # Unfreeze everything after the boundary
+    for layer in base_model.layers[freeze_up_to:]:
+        layer.trainable = True
+    # Count layers that are actually trainable and have weights
+    unfrozen = sum(1 for l in base_model.layers[freeze_up_to:] if len(l.weights) > 0)
     return unfrozen
 
 

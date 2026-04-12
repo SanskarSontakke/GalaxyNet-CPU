@@ -25,7 +25,8 @@ Input (224×224) → Stage 1: EfficientNetV2B1 (Elliptical vs Non-Elliptical)
 - **3-Phase Resolution Curriculum**: 128→192→224px progressive resizing
 - **Cosine Annealing with Warm Restarts (SGDR)**: Escapes local minima in complex loss landscapes
 - **Stochastic Weight Averaging (SWA)**: +0.5-1.5% generalization boost
-- **Binary Focal Loss**: Separate gamma per stage (1.5 easy / 2.5 hard)
+- **Binary Focal Loss**: Moderate γ per stage (0.5 easy / 1.5 hard)
+- **Stable Warmup**: Standard BCE for Phase 1 to prevent gradient collapse
 - **Class-Differentiated Augmentation**: Aggressive Mixup + Cutout for irregular class
 - **Stage 2 Ensemble**: 2 models (EfficientNetV2B2 + B1) averaged before threshold
 - **16-TTA**: 4 rotations × 2 flips × 2 crops = systematic coverage

@@ -11,7 +11,9 @@ import json
 import math
 import multiprocessing
 import os
+import pickle
 import random
+import subprocess
 import sys
 import time
 import zipfile
@@ -42,6 +44,11 @@ try:
 except Exception:
     tfa = None
 
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
+
 # ============================================================
 # START OF config.py
 # ============================================================
@@ -57,10 +64,10 @@ class Config:
     output_dir: Path = Path('/kaggle/working/outputs')
 
     # ── Image resolution curriculum ────────────────────────────
-    image_size_phase1: int = 128   # warmup
-    image_size_phase2: int = 192   # mid-tune
-    image_size_phase3: int = 224   # full fine-tune (UPGRADED from 160)
-    center_crop_ratio: float = 0.75  # tighter crop at higher res
+    image_size_phase1: int = 128
+    image_size_phase2: int = 192
+    image_size_phase3: int = 288   # Upgraded to 288px for final precision
+    center_crop_ratio: float = 0.75
 
     # ── Batch sizes (per phase, tuned for P100 16GB) ───────────
     batch_size_phase1: int = 64    # 128px fits large batches
@@ -80,24 +87,29 @@ class Config:
     irregular_threshold: float = 0.500   # tightened from 0.469
     irregular_margin: float = 0.15       # tightened from 0.10
 
+    # ── Soft Labels (V26) ──────────────────────────────────────
+    use_soft_labels: bool = True    # Regress crowd-sourced voting fractions
+    # When True, Stage 1 label = Class1.1 (P(elliptical)),
+    # Stage 2 label = normalized spiral confidence
+
     # ── Stage 1 training (elliptical binary) ───────────────────
     stage1_architecture: str = 'EfficientNetV2B1'
-    stage1_warmup_epochs: int = 8
-    stage1_midtune_epochs: int = 8
+    stage1_warmup_epochs: int = 12
+    stage1_midtune_epochs: int = 10
     stage1_finetune_epochs: int = 20
-    stage1_warmup_lr: float = 1e-3
+    stage1_warmup_lr: float = 3e-4
     stage1_midtune_lr: float = 3e-5
     stage1_finetune_lr: float = 8e-6
     stage1_unfreeze_phase2: int = 50  # unfreeze last 50 layers for phase 2
     stage1_unfreeze_phase3: int = 80  # unfreeze last 80 layers for phase 3
 
     # ── Stage 2 training (spiral vs irregular binary) ──────────
-    stage2_architectures: Tuple[str, ...] = ('EfficientNetV2B2', 'EfficientNetV2B1')
-    stage2_seeds: Tuple[int, ...] = (42, 123)
-    stage2_warmup_epochs: int = 8
+    stage2_architectures: Tuple[str, ...] = ('EfficientNetV2B2', 'EfficientNetV2B1', 'ConvNeXtTiny')
+    stage2_seeds: Tuple[int, ...] = (42, 123, 77)
+    stage2_warmup_epochs: int = 12
     stage2_midtune_epochs: int = 10
     stage2_finetune_epochs: int = 25
-    stage2_warmup_lr: float = 1e-3
+    stage2_warmup_lr: float = 3e-4
     stage2_midtune_lr: float = 3e-5
     stage2_finetune_lr: float = 8e-6
     stage2_unfreeze_phase2: int = 50
@@ -106,9 +118,13 @@ class Config:
     stage1_filter_confidence: float = 0.85
 
     # ── Focal loss ─────────────────────────────────────────────
-    stage1_focal_gamma: float = 1.5   # easier boundary
-    stage2_focal_gamma: float = 2.5   # harder boundary
+    stage1_focal_gamma: float = 2.0   # Standard gamma for stable discrimination
+    stage2_focal_gamma: float = 1.5   # moderate focus on hard examples
     label_smoothing: float = 0.05
+
+    # ── OHEM (V26) ─────────────────────────────────────────────
+    ohem_keep_ratio: float = 0.70     # Keep top 70% hardest examples
+    ohem_start_phase: int = 2         # Only enable in Phase 2+ (not warmup)
 
     # ── Augmentation ───────────────────────────────────────────
     mixup_alpha: float = 0.4          # Beta distribution parameter
@@ -116,6 +132,12 @@ class Config:
     cutout_n_holes_irregular: int = 3
     cutout_n_holes_other: int = 1
     cutout_max_size_ratio: float = 0.20
+
+    # ── Astronomy-Specific Augmentations (V26) ─────────────────
+    augment_poisson_scale: float = 25.0   # Poisson noise intensity (higher = less noise)
+    augment_poisson_prob: float = 0.3     # Probability of applying Poisson noise
+    augment_blur_prob: float = 0.2        # Probability of applying PSF blur
+    augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)  # Gaussian blur sigma range
 
     # ── SWA ────────────────────────────────────────────────────
     swa_epochs: int = 5
@@ -128,6 +150,12 @@ class Config:
     # ── Runtime ────────────────────────────────────────────────
     enable_mixed_precision: bool = True
     use_sample_weighting: bool = True
+
+    # ── XGBoost Stacking (V26) ─────────────────────────────────
+    use_xgboost_stacking: bool = True
+    xgb_n_estimators: int = 300
+    xgb_max_depth: int = 6
+    xgb_learning_rate: float = 0.05
 
     # ── Minimum class counts after threshold tightening ────────
     min_irregular_count: int = 3000
@@ -436,6 +464,7 @@ def run_swa(
 
 
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
 class BinaryFocalLoss(tf.keras.losses.Loss):
     """Binary focal loss for cascade binary classification stages.
 
@@ -463,9 +492,9 @@ class BinaryFocalLoss(tf.keras.losses.Loss):
         self.label_smoothing = label_smoothing
 
     def call(self, y_true, y_pred):
-        # Ensure float32 for numerical stability (critical for mixed precision)
-        y_true = tf.cast(y_true, tf.float32)
+        # Ensure matching shapes to prevent unintended broadcasting [batch, batch]
         y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(tf.reshape(y_true, tf.shape(y_pred)), tf.float32)
 
         # Label smoothing
         if self.label_smoothing > 0:
@@ -551,9 +580,95 @@ class CategoricalFocalLoss(tf.keras.losses.Loss):
         })
         return config
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class OHEMBinaryLoss(tf.keras.losses.Loss):
+    """Online Hard Example Mining loss for binary classification.
+
+    Computes per-sample binary cross entropy, then only keeps the top-K%
+    hardest examples (highest loss) for gradient computation. Easy examples
+    that the model already classifies correctly are discarded.
+
+    This forces the optimizer to spend 100% of its gradient budget on the
+    confusing boundary cases (e.g., ambiguous spiral/irregular galaxies).
+
+    Args:
+        keep_ratio: Fraction of hardest examples to keep (0.7 = top 70%).
+        label_smoothing: Optional label smoothing factor.
+    """
+
+    def __init__(
+        self,
+        keep_ratio: float = 0.70,
+        label_smoothing: float = 0.0,
+        name: str = 'ohem_binary_loss',
+        **kwargs,
+    ):
+        super().__init__(name=name, reduction='none', **kwargs)
+        self.keep_ratio = keep_ratio
+        self.label_smoothing = label_smoothing
+
+    def call(self, y_true, y_pred):
+        y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(tf.reshape(y_true, tf.shape(y_pred)), tf.float32)
+
+        if self.label_smoothing > 0:
+            y_true = y_true * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+
+        # Per-sample binary cross entropy
+        bce = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+        bce = tf.reduce_mean(bce, axis=-1)  # [batch_size]
+
+        # Keep only the top-K% hardest examples
+        batch_size = tf.shape(bce)[0]
+        k = tf.maximum(tf.cast(tf.cast(batch_size, tf.float32) * self.keep_ratio, tf.int32), 1)
+
+        # Get top-k losses
+        top_k_losses, _ = tf.math.top_k(bce, k=k, sorted=False)
+
+        return tf.reduce_mean(top_k_losses)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'keep_ratio': self.keep_ratio,
+            'label_smoothing': self.label_smoothing,
+        })
+        return config
+
 
 # Backwards compatibility alias
 FocalLoss = CategoricalFocalLoss
+
+# ══════════════════════════════════════════════════════════════
+# CUSTOM METRICS FOR SOFT LABELS
+# ══════════════════════════════════════════════════════════════
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftBinaryAccuracy(tf.keras.metrics.BinaryAccuracy):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftAUC(tf.keras.metrics.AUC):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftPrecision(tf.keras.metrics.Precision):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class SoftRecall(tf.keras.metrics.Recall):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
+        return super().update_state(y_true_bin, y_pred, sample_weight)
 
 
 # ============================================================
@@ -660,14 +775,18 @@ def unfreeze_top_layers(base_model: tf.keras.Model, last_n: int) -> int:
     """Gradually unfreezes the last N layers of the base model for fine-tuning.
 
     All layers before the last N are frozen (not trainable).
-    Returns the number of unfrozen layers.
+    Returns the number of unfrozen layers (those with trainable weights).
     """
     base_model.trainable = True
     total_layers = len(base_model.layers)
     freeze_up_to = max(0, total_layers - last_n)
     for layer in base_model.layers[:freeze_up_to]:
         layer.trainable = False
-    unfrozen = sum(1 for l in base_model.layers if l.trainable)
+    # Unfreeze everything after the boundary
+    for layer in base_model.layers[freeze_up_to:]:
+        layer.trainable = True
+    # Count layers that are actually trainable and have weights
+    unfrozen = sum(1 for l in base_model.layers[freeze_up_to:] if len(l.weights) > 0)
     return unfrozen
 
 
@@ -734,7 +853,10 @@ def compute_sample_weights(df: pd.DataFrame, label_col: str = 'label_id', n_clas
 
 
 def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> pd.DataFrame:
-    """Generate 3-class labels DataFrame from Galaxy Zoo solutions CSV."""
+    """Generate 3-class labels DataFrame from Galaxy Zoo solutions CSV.
+
+    V26: Also preserves raw voting fractions for soft label training.
+    """
     df = pd.read_csv(solutions_csv)
     required_cols = {'GalaxyID', 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2'}
     missing = required_cols - set(df.columns)
@@ -747,7 +869,10 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> 
     df = df[df['image_path'].apply(lambda p: Path(p).exists())].copy()
     df['label_id'] = df['label'].map(CLASS_TO_ID)
 
-    return df[['GalaxyID', 'image_path', 'label', 'label_id']]
+    # V26: Preserve raw voting fractions for soft label training
+    keep_cols = ['GalaxyID', 'image_path', 'label', 'label_id',
+                 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2']
+    return df[keep_cols]
 
 
 def validate_class_counts(labels_df: pd.DataFrame, config: Config) -> None:
@@ -853,24 +978,104 @@ def apply_cutout(image: tf.Tensor, n_holes: int = 2, max_size_ratio: float = 0.2
     return image
 
 
+# ── V26: ASTRONOMY-SPECIFIC AUGMENTATIONS ──
+
+def apply_poisson_noise(image: tf.Tensor, scale: float = 25.0) -> tf.Tensor:
+    """Simulate CCD detector shot noise via Poisson process.
+
+    Real telescope images have photon counting noise proportional to sqrt(signal).
+    Scale controls SNR: higher = less noise (brighter source simulation).
+    """
+    # Normalize to [0, 1], apply Poisson, scale back
+    img_norm = image / 255.0
+    img_scaled = img_norm * scale
+    # Poisson noise: output has same expected value but with shot noise
+    noisy = tf.random.poisson(shape=[], lam=tf.maximum(img_scaled, 1e-6))
+    noisy = noisy / scale * 255.0
+    return tf.clip_by_value(noisy, 0.0, 255.0)
+
+
+def apply_gaussian_blur(image: tf.Tensor, sigma: float = 1.0) -> tf.Tensor:
+    """Simulate atmospheric PSF (Point Spread Function) via Gaussian blur.
+
+    Real telescope observations are degraded by atmospheric turbulence ('seeing').
+    Sigma controls the blur radius in pixels.
+    """
+    # Build 2D Gaussian kernel
+    kernel_size = tf.cast(tf.math.ceil(sigma * 3.0) * 2 + 1, tf.int32)
+    kernel_size = tf.maximum(kernel_size, 3)
+    half = tf.cast(kernel_size // 2, tf.float32)
+    x = tf.range(-half, half + 1, dtype=tf.float32)
+    kernel_1d = tf.exp(-x ** 2 / (2.0 * sigma ** 2))
+    kernel_1d = kernel_1d / tf.reduce_sum(kernel_1d)
+    kernel_2d = tf.tensordot(kernel_1d, kernel_1d, axes=0)
+    kernel_2d = kernel_2d[:, :, tf.newaxis, tf.newaxis]  # [H, W, 1, 1]
+    kernel_2d = tf.tile(kernel_2d, [1, 1, 3, 1])  # [H, W, 3, 1]
+
+    # Apply depthwise convolution
+    image_4d = tf.expand_dims(image, 0)  # [1, H, W, C]
+    blurred = tf.nn.depthwise_conv2d(image_4d, kernel_2d, strides=[1, 1, 1, 1], padding='SAME')
+    return tf.squeeze(blurred, 0)
+
+
+def apply_continuous_rotation(image: tf.Tensor) -> tf.Tensor:
+    """Apply continuous 0-360° rotation (pure TF, no tfa dependency).
+
+    Galaxies have no preferred orientation axis — this is the most
+    physically justified augmentation for astronomical images.
+    """
+    if tfa is not None:
+        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
+        return tfa.image.rotate(image, angle, interpolation='BILINEAR')
+    else:
+        # Pure TF continuous rotation via affine transform
+        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
+        cos_a = tf.cos(angle)
+        sin_a = tf.sin(angle)
+        h = tf.cast(tf.shape(image)[0], tf.float32)
+        w = tf.cast(tf.shape(image)[1], tf.float32)
+        # Center-origin affine: translate, rotate, translate back
+        cx, cy = w / 2.0, h / 2.0
+        # Inverse transform matrix for tf.raw_ops.ImageProjectiveTransformV3
+        # [a0, a1, a2, b0, b1, b2, c0, c1] where:
+        # x_src = a0*x_dst + a1*y_dst + a2
+        # y_src = b0*x_dst + b1*y_dst + b2
+        a2 = cx - cx * cos_a - cy * sin_a
+        b2 = cy + cx * sin_a - cy * cos_a
+        transform = [cos_a, sin_a, a2, -sin_a, cos_a, b2, 0.0, 0.0]
+        transform = tf.cast(tf.stack(transform), tf.float32)
+        transform = tf.reshape(transform, [1, 8])
+        image_4d = tf.expand_dims(image, 0)
+        rotated = tf.raw_ops.ImageProjectiveTransformV3(
+            images=image_4d,
+            transforms=transform,
+            output_shape=tf.shape(image)[:2],
+            fill_value=0.0,
+            interpolation='BILINEAR',
+            fill_mode='REFLECT',
+        )
+        return tf.squeeze(rotated, 0)
+
+
 def augment_image(image: tf.Tensor, label: tf.Tensor, weight: tf.Tensor = None):
-    """Standard augmentation for binary classification (orientation-preserving)."""
+    """Standard augmentation with V26 astronomy-specific additions."""
     shape = tf.shape(image)
     orig_h, orig_w = shape[0], shape[1]
 
-    if tfa is not None:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        image = tfa.image.rotate(image, angle, interpolation='BILINEAR')
-    else:
-        image = tf.image.rot90(image, k=tf.random.uniform([], 0, 4, dtype=tf.int32))
+    # V26: Continuous rotation (0-360°) — galaxies have no preferred orientation
+    image = apply_continuous_rotation(image)
 
     image = tf.image.random_flip_left_right(image)
     image = tf.image.random_flip_up_down(image)
 
-    # Blur simulation (20% probability)
-    if tf.random.uniform([]) > 0.8:
-        image = tf.image.resize(image, [orig_h // 2, orig_w // 2])
-        image = tf.image.resize(image, [orig_h, orig_w])
+    # V26: Poisson CCD noise (30% probability)
+    if tf.random.uniform([]) < 0.3:
+        image = apply_poisson_noise(image, scale=25.0)
+
+    # V26: PSF blur — atmospheric seeing simulation (20% probability)
+    if tf.random.uniform([]) < 0.2:
+        sigma = tf.random.uniform([], 0.5, 2.0)
+        image = apply_gaussian_blur(image, sigma)
 
     # Brightness/contrast (50% probability)
     if tf.random.uniform([]) > 0.5:
@@ -1035,13 +1240,28 @@ def build_binary_dataset_stage1(
     shuffle: bool = False,
     weights: np.ndarray = None,
 ) -> tf.data.Dataset:
-    """Build binary dataset for Stage 1: elliptical (1) vs non-elliptical (0)."""
+    """Build binary dataset for Stage 1: elliptical (1) vs non-elliptical (0).
+
+    V26 Soft Labels: When config.use_soft_labels is True, the label is the
+    raw Galaxy Zoo voting fraction Class1.1 (P(elliptical)) instead of a
+    hard 0/1 binary. This preserves human uncertainty and reduces overfitting
+    to noisy crowd-sourced boundaries.
+
+    Note: Stage 1 uses class_weight in fit() for balancing, NOT sample_weight
+    in the dataset. This avoids loss-scale instability during resolution jumps.
+    """
     paths = df['image_path'].astype(str).to_numpy()
-    # Binary labels: 1 = elliptical, 0 = non-elliptical
-    binary_labels = (df['label'] == 'elliptical').astype(np.float32).to_numpy()
+
+    if config.use_soft_labels and 'Class1.1' in df.columns:
+        # Soft label: raw voting fraction P(elliptical) ∈ [0, 1]
+        soft_labels = df['Class1.1'].astype(np.float32).to_numpy()
+        soft_labels = np.clip(soft_labels, 0.0, 1.0).reshape(-1, 1)
+    else:
+        # Hard binary labels: 1 = elliptical, 0 = non-elliptical
+        soft_labels = (df['label'] == 'elliptical').astype(np.float32).to_numpy()
 
     return build_dataset(
-        paths, binary_labels, image_size, batch_size,
+        paths, soft_labels, image_size, batch_size,
         center_crop_ratio=config.center_crop_ratio,
         weights=weights, augment=augment, shuffle=shuffle,
     )
@@ -1059,22 +1279,37 @@ def build_binary_dataset_stage2(
 ) -> tf.data.Dataset:
     """Build binary dataset for Stage 2: spiral (1) vs irregular (0).
     Only include spiral and irregular samples (no ellipticals).
+
+    V26 Soft Labels: When config.use_soft_labels is True, the label is a
+    normalized spiral confidence derived from the voting fractions:
+      soft_label = Class1.2 / (Class1.2 + Class6.1 + epsilon)
+    This captures the degree of 'spiralness' vs 'oddness'.
     """
     # Filter to only spiral + irregular
     mask = df['label'].isin(['spiral', 'irregular'])
     df_filtered = df[mask].copy()
 
     paths = df_filtered['image_path'].astype(str).to_numpy()
-    # Binary labels: 1 = spiral, 0 = irregular
-    binary_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy()
+
+    if config.use_soft_labels and 'Class1.2' in df_filtered.columns and 'Class6.1' in df_filtered.columns:
+        # Soft label: normalized spiral confidence
+        spiral_vote = df_filtered['Class1.2'].astype(np.float32).to_numpy()
+        odd_vote = df_filtered['Class6.1'].astype(np.float32).to_numpy()
+        soft_labels = (spiral_vote / (spiral_vote + odd_vote + 1e-7)).reshape(-1, 1)
+        soft_labels = np.clip(soft_labels, 0.0, 1.0)
+    else:
+        # Hard binary labels: 1 = spiral, 0 = irregular
+        soft_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy().reshape(-1, 1)
 
     # Compute sample weights for the binary imbalanced problem
+    # Use hard label assignment for weight computation (soft labels shouldn't affect balancing)
+    hard_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy()
     if weights is None and config.use_sample_weighting:
-        n_spiral = (binary_labels == 1).sum()
-        n_irregular = (binary_labels == 0).sum()
+        n_spiral = (hard_labels == 1).sum()
+        n_irregular = (hard_labels == 0).sum()
         weight_irregular = n_spiral / max(n_irregular, 1)
         weight_spiral = 1.0
-        weights = np.where(binary_labels == 1, weight_spiral, weight_irregular).astype(np.float32)
+        weights = np.where(hard_labels == 1, weight_spiral, weight_irregular).astype(np.float32)
         # Normalize to mean=1
         weights = weights / weights.mean()
 
@@ -1082,7 +1317,7 @@ def build_binary_dataset_stage2(
     aug_fn = augment_image if not use_irregular_augment else None
 
     return build_dataset(
-        paths, binary_labels, image_size, batch_size,
+        paths, soft_labels, image_size, batch_size,
         center_crop_ratio=config.center_crop_ratio,
         weights=weights, augment=augment, augment_fn=aug_fn,
         shuffle=shuffle,
@@ -1098,6 +1333,7 @@ def filter_stage2_training_data(
     Includes samples predicted as non-elliptical AND borderline ellipticals
     (confidence < stage1_filter_confidence) to make Stage 2 robust.
     """
+    from losses import BinaryFocalLoss
 
     model = tf.keras.models.load_model(
         stage1_model_path,
@@ -1187,6 +1423,193 @@ def build_datasets(labels_df: pd.DataFrame, config: Config):
     }
 
     return class_counts, split_info, (train_df, val_df, test_df)
+
+
+# ============================================================
+# START OF stacking.py
+# ============================================================
+
+
+
+
+
+
+def _build_feature_extractor(model: tf.keras.Model) -> tf.keras.Model:
+    """Create a headless version of a trained model that outputs feature vectors.
+
+    Removes the final Dense(1, sigmoid) output layer and returns the model
+    that outputs the penultimate layer's features (before the classification head).
+    """
+    # Find the last Dense layer and use the layer before it as output
+    for i in range(len(model.layers) - 1, -1, -1):
+        layer = model.layers[i]
+        if isinstance(layer, tf.keras.layers.Dense) and layer.output_shape[-1] == 1:
+            # Found the classification head — use the previous layer's output
+            feature_output = model.layers[i - 1].output
+            return tf.keras.Model(inputs=model.input, outputs=feature_output)
+
+    # Fallback: use the second-to-last layer
+    return tf.keras.Model(inputs=model.input, outputs=model.layers[-2].output)
+
+
+def extract_features(
+    model_paths: list[str],
+    df: pd.DataFrame,
+    config: Config,
+    batch_size: int = 32,
+) -> np.ndarray:
+    """Extract deep features from multiple models and concatenate them.
+
+    For each model, removes the classification head and passes all images
+    through the backbone + intermediate layers to get feature vectors.
+    The features from all models are concatenated horizontally.
+
+    Args:
+        model_paths: Paths to trained Keras models.
+        df: DataFrame with 'image_path' column.
+        config: Training config.
+        batch_size: Batch size for feature extraction.
+
+    Returns:
+        features: np.ndarray of shape (n_samples, total_feature_dim)
+    """
+    paths = df['image_path'].astype(str).to_numpy()
+    image_size = config.image_size_phase3
+    dummy_labels = np.zeros(len(paths), dtype=np.float32)
+
+    all_features = []
+    custom_objects = {
+        'BinaryFocalLoss': BinaryFocalLoss,
+        'OHEMBinaryLoss': OHEMBinaryLoss,
+    }
+
+    for model_path in model_paths:
+        print(f'  Extracting features from: {model_path}')
+        model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
+        extractor = _build_feature_extractor(model)
+
+        ds = build_dataset(
+            paths, dummy_labels, image_size, batch_size,
+            center_crop_ratio=config.center_crop_ratio,
+        )
+
+        features = extractor.predict(ds, verbose=0)
+        all_features.append(features)
+
+        # Cleanup
+        del model, extractor
+        tf.keras.backend.clear_session()
+
+    # Concatenate features from all models: (n_samples, dim1 + dim2 + ...)
+    concatenated = np.concatenate(all_features, axis=1)
+    print(f'  Total feature dimension: {concatenated.shape[1]}')
+    return concatenated
+
+
+def train_xgboost_stacker(
+    train_features: np.ndarray,
+    train_labels: np.ndarray,
+    val_features: np.ndarray,
+    val_labels: np.ndarray,
+    config: Config,
+    output_path: Path,
+) -> object:
+    """Train an XGBoost classifier on extracted deep features.
+
+    Uses the concatenated feature vectors from multiple CNN/Transformer
+    backbones to learn non-linear decision boundaries that simple
+    averaging or thresholding cannot capture.
+
+    Args:
+        train_features: Training features from extract_features().
+        train_labels: Integer class labels (0=spiral, 1=elliptical, 2=irregular).
+        val_features: Validation features.
+        val_labels: Validation integer class labels.
+        config: Training config with XGBoost hyperparameters.
+        output_path: Path to save the trained model.
+
+    Returns:
+        Trained XGBoost classifier.
+    """
+    try:
+        import xgboost as xgb
+    except ImportError:
+        print('WARNING: xgboost not available. Installing...')
+        import subprocess
+        subprocess.check_call(['pip', 'install', 'xgboost', '-q'])
+        import xgboost as xgb
+
+    # Compute sample weights for class imbalance
+    class_counts = np.bincount(train_labels, minlength=3)
+    total = len(train_labels)
+    class_weights = total / (3.0 * class_counts + 1e-8)
+    sample_weights = np.array([class_weights[label] for label in train_labels])
+
+    print(f'\n[XGBoost Stacker] Training on {train_features.shape[0]} samples, '
+          f'{train_features.shape[1]} features...')
+    print(f'  Class distribution: {dict(zip(CLASS_NAMES, class_counts))}')
+
+    clf = xgb.XGBClassifier(
+        n_estimators=config.xgb_n_estimators,
+        max_depth=config.xgb_max_depth,
+        learning_rate=config.xgb_learning_rate,
+        objective='multi:softprob',
+        num_class=3,
+        eval_metric='mlogloss',
+        use_label_encoder=False,
+        tree_method='hist',      # Fast histogram-based method
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,           # L1 regularization
+        reg_lambda=1.0,          # L2 regularization
+        random_state=config.seed,
+        verbosity=0,
+    )
+
+    clf.fit(
+        train_features, train_labels,
+        sample_weight=sample_weights,
+        eval_set=[(val_features, val_labels)],
+        verbose=False,
+    )
+
+    # Evaluate on validation set
+    val_preds = clf.predict(val_features)
+    val_acc = float(np.mean(val_preds == val_labels))
+    print(f'  XGBoost val accuracy: {val_acc:.4f}')
+
+    # Save model
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'wb') as f:
+        pickle.dump(clf, f)
+    print(f'  Model saved to: {output_path}')
+
+    return clf
+
+
+def predict_with_stacker(
+    clf,
+    features: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run XGBoost stacker prediction.
+
+    Args:
+        clf: Trained XGBoost classifier.
+        features: Feature vectors from extract_features().
+
+    Returns:
+        predictions: Integer class predictions.
+        probabilities: Class probability matrix (n_samples, 3).
+    """
+    probabilities = clf.predict_proba(features)
+    predictions = clf.predict(features)
+    return predictions.astype(np.int32), probabilities
+
+
+def load_stacker(model_path: Path):
+    """Load a saved XGBoost stacker from disk."""
+    with open(model_path, 'rb') as f:
+        return pickle.load(f)
 
 
 # ============================================================
@@ -1777,7 +2200,24 @@ def evaluate_cascade(
     5. Generate all plots
     """
     print('\n[Evaluation] Loading models...')
-    custom_objects = {'BinaryFocalLoss': BinaryFocalLoss}
+    from losses import (
+        OHEMBinaryLoss,
+        CategoricalFocalLoss,
+        SoftBinaryAccuracy,
+        SoftAUC,
+        SoftPrecision,
+        SoftRecall
+    )
+    custom_objects = {
+        'BinaryFocalLoss': BinaryFocalLoss,
+        'OHEMBinaryLoss': OHEMBinaryLoss,
+        'CategoricalFocalLoss': CategoricalFocalLoss,
+        'FocalLoss': CategoricalFocalLoss,
+        'SoftBinaryAccuracy': SoftBinaryAccuracy,
+        'SoftAUC': SoftAUC,
+        'SoftPrecision': SoftPrecision,
+        'SoftRecall': SoftRecall,
+    }
 
     stage1_model = tf.keras.models.load_model(stage1_model_path, custom_objects=custom_objects)
     stage2_models = [
@@ -1990,12 +2430,12 @@ class ConciseLogging(tf.keras.callbacks.Callback):
 
 
 def _binary_metrics():
-    """Standard metrics for binary classification stages."""
+    """Standard metrics for binary classification stages (Soft Label aware)."""
     return [
-        'binary_accuracy',
-        tf.keras.metrics.AUC(name='auc'),
-        tf.keras.metrics.Precision(name='precision'),
-        tf.keras.metrics.Recall(name='recall'),
+        SoftBinaryAccuracy(name='binary_accuracy'),
+        SoftAUC(name='auc'),
+        SoftPrecision(name='precision'),
+        SoftRecall(name='recall'),
     ]
 
 
@@ -2011,6 +2451,7 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
       Phase 2: 192px mid-tune (unfreeze last 50 layers)
       Phase 3: 224px full fine-tune (unfreeze last 80 layers) + SGDR
     """
+    import gc
     tf.keras.backend.clear_session()
     gc.collect()
 
@@ -2027,22 +2468,26 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
     print('STAGE 1: Elliptical vs Non-Elliptical Binary Classifier')
     print('=' * 60)
 
-    # Compute class imbalance weight
+    # Compute balanced class weights (Keras-standard formula)
     n_ell = (train_df['label'] == 'elliptical').sum()
     n_non_ell = (train_df['label'] != 'elliptical').sum()
-    pos_weight = float(n_non_ell) / max(float(n_ell), 1.0)
-    print(f'  Elliptical: {n_ell}, Non-elliptical: {n_non_ell}, pos_weight: {pos_weight:.3f}')
+    total_s1 = n_ell + n_non_ell
+    # label 0 = non-elliptical (minority), label 1 = elliptical (majority)
+    class_weight_s1 = {
+        0: float(total_s1) / (2.0 * float(n_non_ell)),  # up-weight minority
+        1: float(total_s1) / (2.0 * float(n_ell)),      # down-weight majority
+    }
+    print(f'  Elliptical: {n_ell}, Non-elliptical: {n_non_ell}')
+    print(f'  class_weight: {{0: {class_weight_s1[0]:.3f}, 1: {class_weight_s1[1]:.3f}}}')
 
-    focal = BinaryFocalLoss(
-        gamma=config.stage1_focal_gamma,
-        pos_weight=pos_weight,
-        label_smoothing=0.0,  # No label smoothing for Stage 1 (clean labels)
-    )
+    # Use BCE throughout Stage 1 — Focal loss causes catastrophic collapse
+    # when combined with resolution changes and layer unfreezing.
+    bce_loss = tf.keras.losses.BinaryCrossentropy()
 
     model, base_model = build_stage1_model(architecture=config.stage1_architecture)
 
-    # ── Phase 1: Warmup @ 128px ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px')
+    # ── Phase 1: Warmup @ 128px — Standard BCE (no focal, stable convergence) ──
+    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
     freeze_base(base_model)
 
     train_ds = build_binary_dataset_stage1(
@@ -2055,20 +2500,21 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(config.stage1_warmup_lr, clipnorm=1.0),
-        loss=focal,
+        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for stable Phase 1
         metrics=_binary_metrics(),
     )
 
     h1 = model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.stage1_warmup_epochs,
+        class_weight=class_weight_s1,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'stage1_phase1.keras'),
                 monitor='val_binary_accuracy', save_best_only=True, mode='max',
             ),
             tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=3, restore_best_weights=True,
+                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
             ),
             ConciseLogging(),
         ],
@@ -2094,13 +2540,14 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=focal,
+        loss=bce_loss,  # Keep BCE — switching to Focal here causes collapse
         metrics=_binary_metrics(),
     )
 
     h2 = model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.stage1_midtune_epochs,
+        class_weight=class_weight_s1,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'stage1_phase2.keras'),
@@ -2135,13 +2582,14 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=focal,
+        loss=bce_loss,  # Keep BCE throughout
         metrics=_binary_metrics(),
     )
 
     h3 = model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.stage1_finetune_epochs,
+        class_weight=class_weight_s1,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'stage1_best.keras'),
@@ -2198,6 +2646,7 @@ def _train_stage2_isolated(
     3-phase progressive resizing curriculum with heavier augmentation
     and higher focal gamma for the harder spiral/irregular boundary.
     """
+    import gc
     tf.keras.backend.clear_session()
     gc.collect()
 
@@ -2222,24 +2671,44 @@ def _train_stage2_isolated(
 
     n_spiral = (s2_train['label'] == 'spiral').sum()
     n_irregular = (s2_train['label'] == 'irregular').sum()
-    pos_weight = float(n_spiral) / max(float(n_irregular), 1.0)
-    print(f'  Spiral: {n_spiral}, Irregular: {n_irregular}, pos_weight(spiral/irr): {pos_weight:.3f}')
+    total_s2 = n_spiral + n_irregular
+    # label 0 = irregular (minority), label 1 = spiral (majority)
+    class_weight_s2 = {
+        0: float(total_s2) / (2.0 * float(max(n_irregular, 1))),  # up-weight irregular
+        1: float(total_s2) / (2.0 * float(max(n_spiral, 1))),     # down-weight spiral
+    }
+    print(f'  Spiral: {n_spiral}, Irregular: {n_irregular}')
+    print(f'  class_weight: {{0(irr): {class_weight_s2[0]:.3f}, 1(spi): {class_weight_s2[1]:.3f}}}')
 
+    # Focal loss for Phase 2/3 fallback
     focal = BinaryFocalLoss(
         gamma=config.stage2_focal_gamma,
-        pos_weight=pos_weight,
+        pos_weight=1.0,
         label_smoothing=config.label_smoothing,
     )
 
-    # Adjust batch sizes for larger Stage 2 models
+    # V26: OHEM loss for Phase 2/3 — focus on hardest spiral/irregular examples
+    ohem_loss = OHEMBinaryLoss(
+        keep_ratio=config.ohem_keep_ratio,
+        label_smoothing=config.label_smoothing,
+    )
+
+    # Adjust batch sizes for larger Stage 2 models (P100 16GB VRAM)
     bs_p1 = config.batch_size_phase1
-    bs_p2 = 24 if architecture == 'EfficientNetV2B2' else config.batch_size_phase2
-    bs_p3 = config.batch_size_phase3
+    if architecture == 'ConvNeXtTiny':
+        bs_p2 = 16  # ConvNeXtTiny is heavier than EfficientNet
+        bs_p3 = 12
+    elif architecture == 'EfficientNetV2B2':
+        bs_p2 = 24
+        bs_p3 = config.batch_size_phase3
+    else:
+        bs_p2 = config.batch_size_phase2
+        bs_p3 = config.batch_size_phase3
 
     model, base_model = build_stage2_model(architecture=architecture)
 
-    # ── Phase 1: Warmup @ 128px ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px')
+    # ── Phase 1: Warmup @ 128px — Standard BCE for stability ──
+    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
     freeze_base(base_model)
 
     train_ds = build_binary_dataset_stage2(
@@ -2252,7 +2721,7 @@ def _train_stage2_isolated(
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(config.stage2_warmup_lr, clipnorm=1.0),
-        loss=focal,
+        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for Phase 1
         metrics=_binary_metrics(),
     )
 
@@ -2265,7 +2734,7 @@ def _train_stage2_isolated(
                 monitor='val_binary_accuracy', save_best_only=True, mode='max',
             ),
             tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=3, restore_best_weights=True,
+                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
             ),
             ConciseLogging(),
         ],
@@ -2291,7 +2760,7 @@ def _train_stage2_isolated(
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=focal,
+        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 2
         metrics=_binary_metrics(),
     )
 
@@ -2332,7 +2801,7 @@ def _train_stage2_isolated(
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=focal,
+        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 3
         metrics=_binary_metrics(),
     )
 
@@ -2392,6 +2861,7 @@ def run_cascade_training(train_df, val_df, config: Config, output_dir: Path) -> 
     2. Train Stage 2 models (spiral vs irregular) on non-elliptical subset
     3. Each stage runs in a separate subprocess for VRAM isolation
     """
+    import multiprocessing
 
     try:
         multiprocessing.set_start_method('spawn', force=True)
@@ -2470,6 +2940,7 @@ def run_stage2_fallback(train_df, val_df, config: Config, output_dir: Path) -> d
 
     Triggered automatically if irregular_f1 < 0.75 after initial training.
     """
+    import multiprocessing
 
     try:
         multiprocessing.set_start_method('spawn', force=True)
@@ -2581,6 +3052,45 @@ def main():
         output_dir=output_dir,
     )
 
+    # ── V26: XGBoost Stacking ──
+    if config.use_xgboost_stacking:
+        print('\n' + '=' * 70)
+        print('V26: XGBOOST META-LEARNER STACKING')
+        print('=' * 70)
+
+        from stacking import extract_features, train_xgboost_stacker, predict_with_stacker
+
+        # Collect ALL model paths for feature extraction
+        all_model_paths = [str(output_dir / 'stage1_best.keras')] + stage2_model_paths
+
+        print('\n[Stacking] Extracting deep features...')
+        train_features = extract_features(all_model_paths, train_df, config)
+        val_features = extract_features(all_model_paths, val_df, config)
+        test_features = extract_features(all_model_paths, test_df, config)
+
+        train_labels = train_df['label_id'].to_numpy()
+        val_labels = val_df['label_id'].to_numpy()
+        test_labels = test_df['label_id'].to_numpy()
+
+        xgb_model = train_xgboost_stacker(
+            train_features, train_labels,
+            val_features, val_labels,
+            config,
+            output_path=output_dir / 'xgb_stacker.pkl',
+        )
+
+        # Evaluate stacked model on test set
+        xgb_preds, xgb_probs = predict_with_stacker(xgb_model, test_features)
+        xgb_acc = float(np.mean(xgb_preds == test_labels))
+        print(f'\n[Stacking] XGBoost Test Accuracy: {xgb_acc:.4f}')
+
+        # Store stacking results in eval_results
+        eval_results['xgboost_stacking'] = {
+            'test_accuracy': xgb_acc,
+            'feature_dim': train_features.shape[1],
+            'n_models': len(all_model_paths),
+        }
+
     # ── Check if fallback is needed ──
     irregular_f1 = eval_results.get('cascade_evaluation', {}).get(
         'classification_report', {}
@@ -2619,6 +3129,7 @@ def main():
                 eval_results['fallback_triggered'] = True
 
     # ── Compile final metrics ──
+    import datetime
 
     final_metrics = {
         'run_id': 'v25_cascade_224px',

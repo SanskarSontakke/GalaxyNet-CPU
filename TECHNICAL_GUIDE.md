@@ -42,9 +42,9 @@ sequenceDiagram
     participant P3 as Phase 3: Fine-Tune (224px)
     participant SWA as Step 4: SWA Averaging
 
-    Note over P1: Frozen Backbone<br/>High LR (1e-3)
+    Note over P1: Frozen Backbone<br/>Low LR (3e-4)<br/>Standard BCE Loss
     P1->>P2: Unfreeze last 50 layers
-    Note over P2: Mid LR (3e-5)<br/>Increase Resolution
+    Note over P2: Mid LR (3e-5)<br/>Binary Focal Loss (γ)
     P2->>P3: Unfreeze last 80 layers
     Note over P3: Low LR (8e-6)<br/>SGDR Scheduler
     P3->>SWA: 5 Epochs Cyclical LR
@@ -58,7 +58,9 @@ sequenceDiagram
 | **LLRD** | Layer-wise Learning Rate Decay | Prevents catastrophic forgetting in early backbone layers. |
 | **SGDR** | Cosine Annealing with Restarts | Helps the optimizer escape local minima at high resolutions. |
 | **SWA** | Stochastic Weight Averaging | Produces a model in a wider minimum, increasing test robustness by ~1%. |
-| **Focal Loss** | Binary Focal (Stage 1: γ=1.5 / Stage 2: γ=2.5) | Forces the model to focus on hard, misclassified examples. |
+| **Warmup** | BCE Phase 1 | Uses Standard Binary Crossentropy during warmup to avoid Focal Loss gradient traps. |
+| **Focal Loss** | Binary Focal (Stage 1: γ=0.5 / Stage 2: γ=1.5) | Forces focus on hard samples after stable warmup. |
+| **Imbalance** | Balanced `class_weight` | Infit-time balancing using `class_weight` (not `pos_weight`) for gradient stability. |
 
 ---
 
@@ -151,7 +153,7 @@ flowchart LR
 
 ### How to Extend
 1. **Backbone Architecture**: Modify `stage1_architecture` in `config.py` to test different EfficientNet or ConvNeXt variants.
-2. **Loss Weights**: Adjust `pos_weight` calculation in `train.py` if class imbalance shifts.
+2. **Loss Strategy**: Adjust gammas or warmup durations in `config.py`. Immbalance is handled automatically via `class_weight` in `train.py`.
 3. **Threshold Calibration**: The calibration logic in `evaluate.py` can be updated to prioritize specific metrics like Irregular F1.
 
 ---

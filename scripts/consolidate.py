@@ -8,6 +8,7 @@ MODULES = [
     'losses.py',
     'model.py',
     'dataset.py',
+    'stacking.py',
     'evaluate.py',
     'train.py',
 ]
@@ -15,14 +16,14 @@ MODULES = [
 OUTPUT_FILE = 'train_kaggle_bundle.py'
 
 # Modules whose imports are consolidated into the header
-LOCAL_MODULES = {'config', 'utils', 'losses', 'model', 'dataset', 'evaluate', 'train'}
+LOCAL_MODULES = {'config', 'utils', 'losses', 'model', 'dataset', 'stacking', 'evaluate', 'train'}
 
 HEADER_MODULES = {
     'argparse', 'datetime', 'gc', 'json', 'math', 'multiprocessing',
-    'os', 'random', 'sys', 'time', 'zipfile', 'dataclasses',
+    'os', 'pickle', 'random', 'subprocess', 'sys', 'time', 'zipfile', 'dataclasses',
     'pathlib', 'typing',
     'matplotlib', 'numpy', 'np', 'pandas', 'pd', 'tensorflow', 'tf',
-    'sklearn',
+    'sklearn', 'xgboost', 'xgb',
 }
 
 
@@ -58,7 +59,9 @@ import json
 import math
 import multiprocessing
 import os
+import pickle
 import random
+import subprocess
 import sys
 import time
 import zipfile
@@ -88,6 +91,11 @@ try:
     import tensorflow_addons as tfa
 except Exception:
     tfa = None
+
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
 
 '''
 
@@ -133,8 +141,8 @@ except Exception:
                     i += 1
                 continue
 
-            # Check if this is an import line
-            if _is_import_line(stripped):
+            # Check if this is a TOP-LEVEL import line (ignore indented imports in try blocks/functions)
+            if _is_import_line(stripped) and not line.startswith((' ', '\t')):
                 mod = _get_import_module(stripped)
 
                 # Is it a local module import?

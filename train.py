@@ -29,7 +29,14 @@ from dataset import (
     validate_class_counts,
 )
 from evaluate import evaluate_cascade
-from losses import BinaryFocalLoss
+from losses import (
+    BinaryFocalLoss,
+    OHEMBinaryLoss,
+    SoftBinaryAccuracy,
+    SoftAUC,
+    SoftPrecision,
+    SoftRecall,
+)
 from model import build_stage1_model, build_stage2_model, freeze_base, unfreeze_top_layers
 from utils import (
     GradientAccumulationModel,
@@ -62,12 +69,12 @@ class ConciseLogging(tf.keras.callbacks.Callback):
 
 
 def _binary_metrics():
-    """Standard metrics for binary classification stages."""
+    """Standard metrics for binary classification stages (Soft Label aware)."""
     return [
-        'binary_accuracy',
-        tf.keras.metrics.AUC(name='auc'),
-        tf.keras.metrics.Precision(name='precision'),
-        tf.keras.metrics.Recall(name='recall'),
+        SoftBinaryAccuracy(name='binary_accuracy'),
+        SoftAUC(name='auc'),
+        SoftPrecision(name='precision'),
+        SoftRecall(name='recall'),
     ]
 
 
@@ -100,22 +107,26 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
     print('STAGE 1: Elliptical vs Non-Elliptical Binary Classifier')
     print('=' * 60)
 
-    # Compute class imbalance weight
+    # Compute balanced class weights (Keras-standard formula)
     n_ell = (train_df['label'] == 'elliptical').sum()
     n_non_ell = (train_df['label'] != 'elliptical').sum()
-    pos_weight = float(n_non_ell) / max(float(n_ell), 1.0)
-    print(f'  Elliptical: {n_ell}, Non-elliptical: {n_non_ell}, pos_weight: {pos_weight:.3f}')
+    total_s1 = n_ell + n_non_ell
+    # label 0 = non-elliptical (minority), label 1 = elliptical (majority)
+    class_weight_s1 = {
+        0: float(total_s1) / (2.0 * float(n_non_ell)),  # up-weight minority
+        1: float(total_s1) / (2.0 * float(n_ell)),      # down-weight majority
+    }
+    print(f'  Elliptical: {n_ell}, Non-elliptical: {n_non_ell}')
+    print(f'  class_weight: {{0: {class_weight_s1[0]:.3f}, 1: {class_weight_s1[1]:.3f}}}')
 
-    focal = BinaryFocalLoss(
-        gamma=config.stage1_focal_gamma,
-        pos_weight=pos_weight,
-        label_smoothing=0.0,  # No label smoothing for Stage 1 (clean labels)
-    )
+    # Use BCE throughout Stage 1 — Focal loss causes catastrophic collapse
+    # when combined with resolution changes and layer unfreezing.
+    bce_loss = tf.keras.losses.BinaryCrossentropy()
 
     model, base_model = build_stage1_model(architecture=config.stage1_architecture)
 
-    # ── Phase 1: Warmup @ 128px ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px')
+    # ── Phase 1: Warmup @ 128px — Standard BCE (no focal, stable convergence) ──
+    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
     freeze_base(base_model)
 
     train_ds = build_binary_dataset_stage1(
@@ -128,20 +139,21 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(config.stage1_warmup_lr, clipnorm=1.0),
-        loss=focal,
+        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for stable Phase 1
         metrics=_binary_metrics(),
     )
 
     h1 = model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.stage1_warmup_epochs,
+        class_weight=class_weight_s1,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'stage1_phase1.keras'),
                 monitor='val_binary_accuracy', save_best_only=True, mode='max',
             ),
             tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=3, restore_best_weights=True,
+                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
             ),
             ConciseLogging(),
         ],
@@ -167,13 +179,14 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=focal,
+        loss=bce_loss,  # Keep BCE — switching to Focal here causes collapse
         metrics=_binary_metrics(),
     )
 
     h2 = model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.stage1_midtune_epochs,
+        class_weight=class_weight_s1,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'stage1_phase2.keras'),
@@ -208,13 +221,14 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=focal,
+        loss=bce_loss,  # Keep BCE throughout
         metrics=_binary_metrics(),
     )
 
     h3 = model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.stage1_finetune_epochs,
+        class_weight=class_weight_s1,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'stage1_best.keras'),
@@ -296,24 +310,44 @@ def _train_stage2_isolated(
 
     n_spiral = (s2_train['label'] == 'spiral').sum()
     n_irregular = (s2_train['label'] == 'irregular').sum()
-    pos_weight = float(n_spiral) / max(float(n_irregular), 1.0)
-    print(f'  Spiral: {n_spiral}, Irregular: {n_irregular}, pos_weight(spiral/irr): {pos_weight:.3f}')
+    total_s2 = n_spiral + n_irregular
+    # label 0 = irregular (minority), label 1 = spiral (majority)
+    class_weight_s2 = {
+        0: float(total_s2) / (2.0 * float(max(n_irregular, 1))),  # up-weight irregular
+        1: float(total_s2) / (2.0 * float(max(n_spiral, 1))),     # down-weight spiral
+    }
+    print(f'  Spiral: {n_spiral}, Irregular: {n_irregular}')
+    print(f'  class_weight: {{0(irr): {class_weight_s2[0]:.3f}, 1(spi): {class_weight_s2[1]:.3f}}}')
 
+    # Focal loss for Phase 2/3 fallback
     focal = BinaryFocalLoss(
         gamma=config.stage2_focal_gamma,
-        pos_weight=pos_weight,
+        pos_weight=1.0,
         label_smoothing=config.label_smoothing,
     )
 
-    # Adjust batch sizes for larger Stage 2 models
+    # V26: OHEM loss for Phase 2/3 — focus on hardest spiral/irregular examples
+    ohem_loss = OHEMBinaryLoss(
+        keep_ratio=config.ohem_keep_ratio,
+        label_smoothing=config.label_smoothing,
+    )
+
+    # Adjust batch sizes for larger Stage 2 models (P100 16GB VRAM)
     bs_p1 = config.batch_size_phase1
-    bs_p2 = 24 if architecture == 'EfficientNetV2B2' else config.batch_size_phase2
-    bs_p3 = config.batch_size_phase3
+    if architecture == 'ConvNeXtTiny':
+        bs_p2 = 16  # ConvNeXtTiny is heavier than EfficientNet
+        bs_p3 = 12
+    elif architecture == 'EfficientNetV2B2':
+        bs_p2 = 24
+        bs_p3 = config.batch_size_phase3
+    else:
+        bs_p2 = config.batch_size_phase2
+        bs_p3 = config.batch_size_phase3
 
     model, base_model = build_stage2_model(architecture=architecture)
 
-    # ── Phase 1: Warmup @ 128px ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px')
+    # ── Phase 1: Warmup @ 128px — Standard BCE for stability ──
+    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
     freeze_base(base_model)
 
     train_ds = build_binary_dataset_stage2(
@@ -326,7 +360,7 @@ def _train_stage2_isolated(
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(config.stage2_warmup_lr, clipnorm=1.0),
-        loss=focal,
+        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for Phase 1
         metrics=_binary_metrics(),
     )
 
@@ -339,7 +373,7 @@ def _train_stage2_isolated(
                 monitor='val_binary_accuracy', save_best_only=True, mode='max',
             ),
             tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=3, restore_best_weights=True,
+                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
             ),
             ConciseLogging(),
         ],
@@ -365,7 +399,7 @@ def _train_stage2_isolated(
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=focal,
+        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 2
         metrics=_binary_metrics(),
     )
 
@@ -406,7 +440,7 @@ def _train_stage2_isolated(
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=focal,
+        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 3
         metrics=_binary_metrics(),
     )
 
@@ -656,6 +690,45 @@ def main():
         config=config,
         output_dir=output_dir,
     )
+
+    # ── V26: XGBoost Stacking ──
+    if config.use_xgboost_stacking:
+        print('\n' + '=' * 70)
+        print('V26: XGBOOST META-LEARNER STACKING')
+        print('=' * 70)
+
+        from stacking import extract_features, train_xgboost_stacker, predict_with_stacker
+
+        # Collect ALL model paths for feature extraction
+        all_model_paths = [str(output_dir / 'stage1_best.keras')] + stage2_model_paths
+
+        print('\n[Stacking] Extracting deep features...')
+        train_features = extract_features(all_model_paths, train_df, config)
+        val_features = extract_features(all_model_paths, val_df, config)
+        test_features = extract_features(all_model_paths, test_df, config)
+
+        train_labels = train_df['label_id'].to_numpy()
+        val_labels = val_df['label_id'].to_numpy()
+        test_labels = test_df['label_id'].to_numpy()
+
+        xgb_model = train_xgboost_stacker(
+            train_features, train_labels,
+            val_features, val_labels,
+            config,
+            output_path=output_dir / 'xgb_stacker.pkl',
+        )
+
+        # Evaluate stacked model on test set
+        xgb_preds, xgb_probs = predict_with_stacker(xgb_model, test_features)
+        xgb_acc = float(np.mean(xgb_preds == test_labels))
+        print(f'\n[Stacking] XGBoost Test Accuracy: {xgb_acc:.4f}')
+
+        # Store stacking results in eval_results
+        eval_results['xgboost_stacking'] = {
+            'test_accuracy': xgb_acc,
+            'feature_dim': train_features.shape[1],
+            'n_models': len(all_model_paths),
+        }
 
     # ── Check if fallback is needed ──
     irregular_f1 = eval_results.get('cascade_evaluation', {}).get(

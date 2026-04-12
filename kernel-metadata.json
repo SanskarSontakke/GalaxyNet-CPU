@@ -1,6 +1,6 @@
 {
-  "id": "sanskarsontakke/galaxynet-training",
-  "title": "GalaxyNet V25 Cascade Training",
+  "id": "sanskarsontakke/galaxynet-cpu",
+  "title": "GalaxyNet CPU",
   "code_file": "train_kaggle_bundle.py",
   "language": "python",
   "kernel_type": "script",

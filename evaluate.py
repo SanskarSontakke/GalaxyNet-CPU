@@ -604,7 +604,24 @@ def evaluate_cascade(
     5. Generate all plots
     """
     print('\n[Evaluation] Loading models...')
-    custom_objects = {'BinaryFocalLoss': BinaryFocalLoss}
+    from losses import (
+        OHEMBinaryLoss, 
+        CategoricalFocalLoss,
+        SoftBinaryAccuracy,
+        SoftAUC,
+        SoftPrecision,
+        SoftRecall
+    )
+    custom_objects = {
+        'BinaryFocalLoss': BinaryFocalLoss,
+        'OHEMBinaryLoss': OHEMBinaryLoss,
+        'CategoricalFocalLoss': CategoricalFocalLoss,
+        'FocalLoss': CategoricalFocalLoss,
+        'SoftBinaryAccuracy': SoftBinaryAccuracy,
+        'SoftAUC': SoftAUC,
+        'SoftPrecision': SoftPrecision,
+        'SoftRecall': SoftRecall,
+    }
 
     stage1_model = tf.keras.models.load_model(stage1_model_path, custom_objects=custom_objects)
     stage2_models = [

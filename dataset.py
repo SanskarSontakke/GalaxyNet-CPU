@@ -65,7 +65,10 @@ def compute_sample_weights(df: pd.DataFrame, label_col: str = 'label_id', n_clas
 
 
 def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> pd.DataFrame:
-    """Generate 3-class labels DataFrame from Galaxy Zoo solutions CSV."""
+    """Generate 3-class labels DataFrame from Galaxy Zoo solutions CSV.
+    
+    V26: Also preserves raw voting fractions for soft label training.
+    """
     df = pd.read_csv(solutions_csv)
     required_cols = {'GalaxyID', 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2'}
     missing = required_cols - set(df.columns)
@@ -78,7 +81,10 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> 
     df = df[df['image_path'].apply(lambda p: Path(p).exists())].copy()
     df['label_id'] = df['label'].map(CLASS_TO_ID)
 
-    return df[['GalaxyID', 'image_path', 'label', 'label_id']]
+    # V26: Preserve raw voting fractions for soft label training
+    keep_cols = ['GalaxyID', 'image_path', 'label', 'label_id',
+                 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2']
+    return df[keep_cols]
 
 
 def validate_class_counts(labels_df: pd.DataFrame, config: Config) -> None:
@@ -184,24 +190,104 @@ def apply_cutout(image: tf.Tensor, n_holes: int = 2, max_size_ratio: float = 0.2
     return image
 
 
+# ── V26: ASTRONOMY-SPECIFIC AUGMENTATIONS ──
+
+def apply_poisson_noise(image: tf.Tensor, scale: float = 25.0) -> tf.Tensor:
+    """Simulate CCD detector shot noise via Poisson process.
+    
+    Real telescope images have photon counting noise proportional to sqrt(signal).
+    Scale controls SNR: higher = less noise (brighter source simulation).
+    """
+    # Normalize to [0, 1], apply Poisson, scale back
+    img_norm = image / 255.0
+    img_scaled = img_norm * scale
+    # Poisson noise: output has same expected value but with shot noise
+    noisy = tf.random.poisson(shape=[], lam=tf.maximum(img_scaled, 1e-6))
+    noisy = noisy / scale * 255.0
+    return tf.clip_by_value(noisy, 0.0, 255.0)
+
+
+def apply_gaussian_blur(image: tf.Tensor, sigma: float = 1.0) -> tf.Tensor:
+    """Simulate atmospheric PSF (Point Spread Function) via Gaussian blur.
+    
+    Real telescope observations are degraded by atmospheric turbulence ('seeing').
+    Sigma controls the blur radius in pixels.
+    """
+    # Build 2D Gaussian kernel
+    kernel_size = tf.cast(tf.math.ceil(sigma * 3.0) * 2 + 1, tf.int32)
+    kernel_size = tf.maximum(kernel_size, 3)
+    half = tf.cast(kernel_size // 2, tf.float32)
+    x = tf.range(-half, half + 1, dtype=tf.float32)
+    kernel_1d = tf.exp(-x ** 2 / (2.0 * sigma ** 2))
+    kernel_1d = kernel_1d / tf.reduce_sum(kernel_1d)
+    kernel_2d = tf.tensordot(kernel_1d, kernel_1d, axes=0)
+    kernel_2d = kernel_2d[:, :, tf.newaxis, tf.newaxis]  # [H, W, 1, 1]
+    kernel_2d = tf.tile(kernel_2d, [1, 1, 3, 1])  # [H, W, 3, 1]
+    
+    # Apply depthwise convolution
+    image_4d = tf.expand_dims(image, 0)  # [1, H, W, C]
+    blurred = tf.nn.depthwise_conv2d(image_4d, kernel_2d, strides=[1, 1, 1, 1], padding='SAME')
+    return tf.squeeze(blurred, 0)
+
+
+def apply_continuous_rotation(image: tf.Tensor) -> tf.Tensor:
+    """Apply continuous 0-360° rotation (pure TF, no tfa dependency).
+    
+    Galaxies have no preferred orientation axis — this is the most
+    physically justified augmentation for astronomical images.
+    """
+    if tfa is not None:
+        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
+        return tfa.image.rotate(image, angle, interpolation='BILINEAR')
+    else:
+        # Pure TF continuous rotation via affine transform
+        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
+        cos_a = tf.cos(angle)
+        sin_a = tf.sin(angle)
+        h = tf.cast(tf.shape(image)[0], tf.float32)
+        w = tf.cast(tf.shape(image)[1], tf.float32)
+        # Center-origin affine: translate, rotate, translate back
+        cx, cy = w / 2.0, h / 2.0
+        # Inverse transform matrix for tf.raw_ops.ImageProjectiveTransformV3
+        # [a0, a1, a2, b0, b1, b2, c0, c1] where:
+        # x_src = a0*x_dst + a1*y_dst + a2
+        # y_src = b0*x_dst + b1*y_dst + b2
+        a2 = cx - cx * cos_a - cy * sin_a
+        b2 = cy + cx * sin_a - cy * cos_a
+        transform = [cos_a, sin_a, a2, -sin_a, cos_a, b2, 0.0, 0.0]
+        transform = tf.cast(tf.stack(transform), tf.float32)
+        transform = tf.reshape(transform, [1, 8])
+        image_4d = tf.expand_dims(image, 0)
+        rotated = tf.raw_ops.ImageProjectiveTransformV3(
+            images=image_4d,
+            transforms=transform,
+            output_shape=tf.shape(image)[:2],
+            fill_value=0.0,
+            interpolation='BILINEAR',
+            fill_mode='REFLECT',
+        )
+        return tf.squeeze(rotated, 0)
+
+
 def augment_image(image: tf.Tensor, label: tf.Tensor, weight: tf.Tensor = None):
-    """Standard augmentation for binary classification (orientation-preserving)."""
+    """Standard augmentation with V26 astronomy-specific additions."""
     shape = tf.shape(image)
     orig_h, orig_w = shape[0], shape[1]
 
-    if tfa is not None:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        image = tfa.image.rotate(image, angle, interpolation='BILINEAR')
-    else:
-        image = tf.image.rot90(image, k=tf.random.uniform([], 0, 4, dtype=tf.int32))
+    # V26: Continuous rotation (0-360°) — galaxies have no preferred orientation
+    image = apply_continuous_rotation(image)
 
     image = tf.image.random_flip_left_right(image)
     image = tf.image.random_flip_up_down(image)
 
-    # Blur simulation (20% probability)
-    if tf.random.uniform([]) > 0.8:
-        image = tf.image.resize(image, [orig_h // 2, orig_w // 2])
-        image = tf.image.resize(image, [orig_h, orig_w])
+    # V26: Poisson CCD noise (30% probability)
+    if tf.random.uniform([]) < 0.3:
+        image = apply_poisson_noise(image, scale=25.0)
+
+    # V26: PSF blur — atmospheric seeing simulation (20% probability)
+    if tf.random.uniform([]) < 0.2:
+        sigma = tf.random.uniform([], 0.5, 2.0)
+        image = apply_gaussian_blur(image, sigma)
 
     # Brightness/contrast (50% probability)
     if tf.random.uniform([]) > 0.5:
@@ -366,13 +452,28 @@ def build_binary_dataset_stage1(
     shuffle: bool = False,
     weights: np.ndarray = None,
 ) -> tf.data.Dataset:
-    """Build binary dataset for Stage 1: elliptical (1) vs non-elliptical (0)."""
+    """Build binary dataset for Stage 1: elliptical (1) vs non-elliptical (0).
+    
+    V26 Soft Labels: When config.use_soft_labels is True, the label is the
+    raw Galaxy Zoo voting fraction Class1.1 (P(elliptical)) instead of a
+    hard 0/1 binary. This preserves human uncertainty and reduces overfitting
+    to noisy crowd-sourced boundaries.
+    
+    Note: Stage 1 uses class_weight in fit() for balancing, NOT sample_weight
+    in the dataset. This avoids loss-scale instability during resolution jumps.
+    """
     paths = df['image_path'].astype(str).to_numpy()
-    # Binary labels: 1 = elliptical, 0 = non-elliptical
-    binary_labels = (df['label'] == 'elliptical').astype(np.float32).to_numpy()
+
+    if config.use_soft_labels and 'Class1.1' in df.columns:
+        # Soft label: raw voting fraction P(elliptical) ∈ [0, 1]
+        soft_labels = df['Class1.1'].astype(np.float32).to_numpy()
+        soft_labels = np.clip(soft_labels, 0.0, 1.0).reshape(-1, 1)
+    else:
+        # Hard binary labels: 1 = elliptical, 0 = non-elliptical
+        soft_labels = (df['label'] == 'elliptical').astype(np.float32).to_numpy()
 
     return build_dataset(
-        paths, binary_labels, image_size, batch_size,
+        paths, soft_labels, image_size, batch_size,
         center_crop_ratio=config.center_crop_ratio,
         weights=weights, augment=augment, shuffle=shuffle,
     )
@@ -390,22 +491,37 @@ def build_binary_dataset_stage2(
 ) -> tf.data.Dataset:
     """Build binary dataset for Stage 2: spiral (1) vs irregular (0).
     Only include spiral and irregular samples (no ellipticals).
+    
+    V26 Soft Labels: When config.use_soft_labels is True, the label is a
+    normalized spiral confidence derived from the voting fractions:
+      soft_label = Class1.2 / (Class1.2 + Class6.1 + epsilon)
+    This captures the degree of 'spiralness' vs 'oddness'.
     """
     # Filter to only spiral + irregular
     mask = df['label'].isin(['spiral', 'irregular'])
     df_filtered = df[mask].copy()
 
     paths = df_filtered['image_path'].astype(str).to_numpy()
-    # Binary labels: 1 = spiral, 0 = irregular
-    binary_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy()
+
+    if config.use_soft_labels and 'Class1.2' in df_filtered.columns and 'Class6.1' in df_filtered.columns:
+        # Soft label: normalized spiral confidence
+        spiral_vote = df_filtered['Class1.2'].astype(np.float32).to_numpy()
+        odd_vote = df_filtered['Class6.1'].astype(np.float32).to_numpy()
+        soft_labels = (spiral_vote / (spiral_vote + odd_vote + 1e-7)).reshape(-1, 1)
+        soft_labels = np.clip(soft_labels, 0.0, 1.0)
+    else:
+        # Hard binary labels: 1 = spiral, 0 = irregular
+        soft_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy().reshape(-1, 1)
 
     # Compute sample weights for the binary imbalanced problem
+    # Use hard label assignment for weight computation (soft labels shouldn't affect balancing)
+    hard_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy()
     if weights is None and config.use_sample_weighting:
-        n_spiral = (binary_labels == 1).sum()
-        n_irregular = (binary_labels == 0).sum()
+        n_spiral = (hard_labels == 1).sum()
+        n_irregular = (hard_labels == 0).sum()
         weight_irregular = n_spiral / max(n_irregular, 1)
         weight_spiral = 1.0
-        weights = np.where(binary_labels == 1, weight_spiral, weight_irregular).astype(np.float32)
+        weights = np.where(hard_labels == 1, weight_spiral, weight_irregular).astype(np.float32)
         # Normalize to mean=1
         weights = weights / weights.mean()
 
@@ -413,7 +529,7 @@ def build_binary_dataset_stage2(
     aug_fn = augment_image if not use_irregular_augment else None
 
     return build_dataset(
-        paths, binary_labels, image_size, batch_size,
+        paths, soft_labels, image_size, batch_size,
         center_crop_ratio=config.center_crop_ratio,
         weights=weights, augment=augment, augment_fn=aug_fn,
         shuffle=shuffle,
