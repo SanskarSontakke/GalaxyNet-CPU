@@ -22,7 +22,7 @@ class Config:
     batch_size_phase1: int = 64
     batch_size_phase2: int = 32
     batch_size_phase3: int = 16
-    grad_accumulation_steps: int = 2  # effective batch = 32 at phase3
+    grad_accumulation_steps: int = 1  # Native batching to avoid tf.Variable placement errors
 
     # ── Data split ─────────────────────────────────────────────
     seed: int = 42
