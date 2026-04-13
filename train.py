@@ -5,7 +5,6 @@ import gc
 import json
 import os
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -18,30 +17,16 @@ if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
 
 from config import Config
 from dataset import (
-    CLASS_NAMES,
-    build_binary_dataset_stage1,
-    build_binary_dataset_stage2,
     build_dataset,
     build_datasets,
-    compute_sample_weights,
-    filter_stage2_training_data,
     generate_labels_df,
-    validate_class_counts,
 )
-from evaluate import evaluate_cascade
-from losses import (
-    BinaryFocalLoss,
-    OHEMBinaryLoss,
-    SoftBinaryAccuracy,
-    SoftAUC,
-    SoftPrecision,
-    SoftRecall,
-)
-from model import build_stage1_model, build_stage2_model, freeze_base, unfreeze_top_layers
+from evaluate import evaluate_regression
+from losses import RMSELoss, rmse_metric
+from model import build_regression_model, freeze_base, unfreeze_top_layers
 from utils import (
     GradientAccumulationModel,
     build_cosine_restart_schedule,
-    build_llrd_optimizer,
     is_kaggle_runtime,
     run_swa,
     save_json,
@@ -53,107 +38,73 @@ from utils import (
 
 class ConciseLogging(tf.keras.callbacks.Callback):
     """Minimal epoch-end logging to keep Kaggle notebook output clean."""
-
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        # Support both 'accuracy' and 'binary_accuracy' metric names
-        acc_key = 'accuracy' if 'accuracy' in logs else 'binary_accuracy'
-        val_acc_key = 'val_accuracy' if 'val_accuracy' in logs else 'val_binary_accuracy'
         msg = (
             f"Epoch {epoch + 1:03d} | "
             f"loss: {logs.get('loss', 0):.4f} | "
-            f"acc: {logs.get(acc_key, 0):.4f} | "
-            f"val_acc: {logs.get(val_acc_key, 0):.4f}"
+            f"rmse: {logs.get('rmse_metric', 0):.4f} | "
+            f"val_loss: {logs.get('val_loss', 0):.4f} | "
+            f"val_rmse: {logs.get('val_rmse_metric', 0):.4f}"
         )
         print(msg)
 
 
-def _binary_metrics():
-    """Standard metrics for binary classification stages (Soft Label aware)."""
-    return [
-        SoftBinaryAccuracy(name='binary_accuracy'),
-        SoftAUC(name='auc'),
-        SoftPrecision(name='precision'),
-        SoftRecall(name='recall'),
-    ]
-
-
-# ══════════════════════════════════════════════════════════════
-# STAGE 1 — ELLIPTICAL BINARY CLASSIFIER
-# ══════════════════════════════════════════════════════════════
-
-def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_str):
-    """Train Stage 1 (elliptical vs non-elliptical) in an isolated subprocess.
+def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Path):
+    """Train single 37-node regression model using progressive resizing."""
     
-    3-phase progressive resizing curriculum:
-      Phase 1: 128px warmup (frozen backbone)
-      Phase 2: 192px mid-tune (unfreeze last 50 layers)
-      Phase 3: 224px full fine-tune (unfreeze last 80 layers) + SGDR
-    """
-    import gc
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-    config = Config(**config_dict)
-    output_dir = Path(output_dir_str)
-    train_df = pd.DataFrame(train_df_dict)
-    val_df = pd.DataFrame(val_df_dict)
-
     set_global_seed(config.seed)
     if config.enable_mixed_precision:
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
+    df, target_cols = generate_labels_df(solutions_csv, image_dir)
+    print(f"Loaded {len(df)} images with {len(target_cols)} regression targets.")
+    
+    split_info, (train_df, val_df, test_df) = build_datasets(df, config)
+    
+    train_paths = train_df['image_path'].values
+    train_labels = train_df[target_cols].values.astype(np.float32)
+    val_paths = val_df['image_path'].values
+    val_labels = val_df[target_cols].values.astype(np.float32)
+    
+    # 2. Build Model
+    model, base_model = build_regression_model(architecture=config.architecture)
+    
+    output_dir = config.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    
     print('\n' + '=' * 60)
-    print('STAGE 1: Elliptical vs Non-Elliptical Binary Classifier')
+    print(f'TRAINING REGRESSION MODEL ({config.architecture})')
     print('=' * 60)
 
-    # Compute balanced class weights (Keras-standard formula)
-    n_ell = (train_df['label'] == 'elliptical').sum()
-    n_non_ell = (train_df['label'] != 'elliptical').sum()
-    total_s1 = n_ell + n_non_ell
-    # label 0 = non-elliptical (minority), label 1 = elliptical (majority)
-    class_weight_s1 = {
-        0: float(total_s1) / (2.0 * float(n_non_ell)),  # up-weight minority
-        1: float(total_s1) / (2.0 * float(n_ell)),      # down-weight majority
-    }
-    print(f'  Elliptical: {n_ell}, Non-elliptical: {n_non_ell}')
-    print(f'  class_weight: {{0: {class_weight_s1[0]:.3f}, 1: {class_weight_s1[1]:.3f}}}')
+    loss_fn = RMSELoss()
 
-    # Use BCE throughout Stage 1 — Focal loss causes catastrophic collapse
-    # when combined with resolution changes and layer unfreezing.
-    bce_loss = tf.keras.losses.BinaryCrossentropy()
-
-    model, base_model = build_stage1_model(architecture=config.stage1_architecture)
-
-    # ── Phase 1: Warmup @ 128px — Standard BCE (no focal, stable convergence) ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
+    # ── Phase 1: Warmup @ 128px ──
+    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (frozen backbone)')
     freeze_base(base_model)
 
-    train_ds = build_binary_dataset_stage1(
-        train_df, config.image_size_phase1, config.batch_size_phase1, config,
-        augment=True, shuffle=True,
+    train_ds = build_dataset(
+        train_paths, train_labels, config.image_size_phase1, config.batch_size_phase1,
+        center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
-    val_ds = build_binary_dataset_stage1(
-        val_df, config.image_size_phase1, config.batch_size_phase1, config,
+    val_ds = build_dataset(
+        val_paths, val_labels, config.image_size_phase1, config.batch_size_phase1,
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(config.stage1_warmup_lr, clipnorm=1.0),
-        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for stable Phase 1
-        metrics=_binary_metrics(),
+        optimizer=tf.keras.optimizers.Adam(config.warmup_lr, clipnorm=1.0),
+        loss=loss_fn,
+        metrics=[rmse_metric],
     )
 
     h1 = model.fit(
         train_ds, validation_data=val_ds,
-        epochs=config.stage1_warmup_epochs,
-        class_weight=class_weight_s1,
+        epochs=config.warmup_epochs,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'stage1_phase1.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
+                str(output_dir / 'phase1.keras'),
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
             ),
             ConciseLogging(),
         ],
@@ -161,665 +112,120 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
     )
 
     # ── Phase 2: Mid-tune @ 192px ──
-    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze last {config.stage1_unfreeze_phase2} layers)')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage1_unfreeze_phase2)
+    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze {config.unfreeze_phase2} layers)')
+    n_unfrozen = unfreeze_top_layers(base_model, config.unfreeze_phase2)
     print(f'  Unfrozen layers: {n_unfrozen}')
 
-    train_ds = build_binary_dataset_stage1(
-        train_df, config.image_size_phase2, config.batch_size_phase2, config,
-        augment=True, shuffle=True,
+    train_ds = build_dataset(
+        train_paths, train_labels, config.image_size_phase2, config.batch_size_phase2,
+        center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
-    val_ds = build_binary_dataset_stage1(
-        val_df, config.image_size_phase2, config.batch_size_phase2, config,
+    val_ds = build_dataset(
+        val_paths, val_labels, config.image_size_phase2, config.batch_size_phase2,
+        center_crop_ratio=config.center_crop_ratio,
     )
 
-    lr_schedule_p2 = tf.keras.optimizers.schedules.CosineDecay(
-        config.stage1_midtune_lr,
-        decay_steps=config.stage1_midtune_epochs * (len(train_df) // config.batch_size_phase2),
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        config.midtune_lr, decay_steps=config.midtune_epochs * (len(train_paths) // config.batch_size_phase2)
     )
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=bce_loss,  # Keep BCE — switching to Focal here causes collapse
-        metrics=_binary_metrics(),
+        optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
+        loss=loss_fn, metrics=[rmse_metric],
     )
 
     h2 = model.fit(
         train_ds, validation_data=val_ds,
-        epochs=config.stage1_midtune_epochs,
-        class_weight=class_weight_s1,
+        epochs=config.midtune_epochs,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'stage1_phase2.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=4, restore_best_weights=True,
+                str(output_dir / 'phase2.keras'),
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
             ),
             ConciseLogging(),
         ],
         verbose=0,
     )
 
-    # ── Phase 3: Full fine-tune @ 224px with SGDR ──
-    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze last {config.stage1_unfreeze_phase3} layers)')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage1_unfreeze_phase3)
-    print(f'  Unfrozen layers: {n_unfrozen}')
+    # ── Phase 3: Full fine-tune @ 288px ──
+    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze {config.unfreeze_phase3} layers)')
+    n_unfrozen = unfreeze_top_layers(base_model, config.unfreeze_phase3)
+    
+    # Use Gradient Accumulation if batch size is small
+    train_ds = build_dataset(
+        train_paths, train_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
+    )
+    val_ds = build_dataset(
+        val_paths, val_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio,
+    )
 
-    steps_per_epoch_p3 = len(train_df) // config.batch_size_phase3
+    steps_per_epoch = len(train_paths) // config.batch_size_phase3
     lr_schedule_p3 = build_cosine_restart_schedule(
-        config.stage1_finetune_lr, steps_per_epoch_p3,
-        restart_epochs=5, t_mul=1.5, m_mul=0.9,
+        config.finetune_lr, steps_per_epoch, restart_epochs=5, t_mul=1.5, m_mul=0.9
     )
+    
+    active_model = model
+    if config.grad_accumulation_steps > 1:
+        active_model = GradientAccumulationModel(model, config.grad_accumulation_steps)
 
-    train_ds = build_binary_dataset_stage1(
-        train_df, config.image_size_phase3, config.batch_size_phase3, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage1(
-        val_df, config.image_size_phase3, config.batch_size_phase3, config,
-    )
-
-    model.compile(
+    active_model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=bce_loss,  # Keep BCE throughout
-        metrics=_binary_metrics(),
+        loss=loss_fn, metrics=[rmse_metric],
     )
 
-    h3 = model.fit(
+    h3 = active_model.fit(
         train_ds, validation_data=val_ds,
-        epochs=config.stage1_finetune_epochs,
-        class_weight=class_weight_s1,
+        epochs=config.finetune_epochs,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'stage1_best.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=8, restore_best_weights=True,
+                str(output_dir / 'unified_best.keras'),
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
             ),
             ConciseLogging(),
         ],
         verbose=0,
     )
 
-    # ── SWA for Stage 1 ──
-    print('\n[Stage 1 SWA]')
-    train_ds_swa = build_binary_dataset_stage1(
-        train_df, config.image_size_phase3, config.batch_size_phase3, config,
-        augment=False, shuffle=True,
+    # ── SWA ──
+    print('\n[SWA Phase]')
+    train_ds_swa = build_dataset(
+        train_paths, train_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=True,
     )
     model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
-    model.save(str(output_dir / 'stage1_best.keras'))
+    model.save(str(output_dir / 'unified_best.keras'))
 
-    # Save training history
-    history = {
-        'phase1': h1.history,
-        'phase2': h2.history,
-        'phase3': h3.history,
-    }
-    # Convert numpy arrays in history to lists for JSON serialization
-    for phase_key, phase_hist in history.items():
-        for metric_key, values in phase_hist.items():
-            history[phase_key][metric_key] = [float(v) for v in values]
-
-    with open(output_dir / 'stage1_history.json', 'w') as f:
-        json.dump(history, f, indent=2)
-
-    print(f'\n[Stage 1] Training complete. Model saved to {output_dir / "stage1_best.keras"}')
+    # Save details
+    save_json(split_info, output_dir / 'split_info.json')
 
     # Cleanup
     tf.keras.backend.clear_session()
     gc.collect()
-
-
-# ══════════════════════════════════════════════════════════════
-# STAGE 2 — SPIRAL vs IRREGULAR BINARY CLASSIFIER
-# ══════════════════════════════════════════════════════════════
-
-def _train_stage2_isolated(
-    train_df_dict, val_df_dict, config_dict, output_dir_str,
-    architecture, seed, model_tag,
-):
-    """Train a single Stage 2 model (spiral vs irregular) in isolated subprocess.
     
-    3-phase progressive resizing curriculum with heavier augmentation
-    and higher focal gamma for the harder spiral/irregular boundary.
-    """
-    import gc
-    tf.keras.backend.clear_session()
-    gc.collect()
+    return test_df, target_cols
 
-    config = Config(**config_dict)
-    output_dir = Path(output_dir_str)
-    train_df = pd.DataFrame(train_df_dict)
-    val_df = pd.DataFrame(val_df_dict)
-
-    set_global_seed(seed)
-    if config.enable_mixed_precision:
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
-
-    print(f'\n{"=" * 60}')
-    print(f'STAGE 2 [{model_tag}]: Spiral vs Irregular ({architecture}, seed={seed})')
-    print(f'{"=" * 60}')
-
-    # Filter to spiral + irregular only
-    mask = train_df['label'].isin(['spiral', 'irregular'])
-    s2_train = train_df[mask].copy().reset_index(drop=True)
-    mask_val = val_df['label'].isin(['spiral', 'irregular'])
-    s2_val = val_df[mask_val].copy().reset_index(drop=True)
-
-    n_spiral = (s2_train['label'] == 'spiral').sum()
-    n_irregular = (s2_train['label'] == 'irregular').sum()
-    total_s2 = n_spiral + n_irregular
-    # label 0 = irregular (minority), label 1 = spiral (majority)
-    class_weight_s2 = {
-        0: float(total_s2) / (2.0 * float(max(n_irregular, 1))),  # up-weight irregular
-        1: float(total_s2) / (2.0 * float(max(n_spiral, 1))),     # down-weight spiral
-    }
-    print(f'  Spiral: {n_spiral}, Irregular: {n_irregular}')
-    print(f'  class_weight: {{0(irr): {class_weight_s2[0]:.3f}, 1(spi): {class_weight_s2[1]:.3f}}}')
-
-    # Focal loss for Phase 2/3 fallback
-    focal = BinaryFocalLoss(
-        gamma=config.stage2_focal_gamma,
-        pos_weight=1.0,
-        label_smoothing=config.label_smoothing,
-    )
-
-    # V26: OHEM loss for Phase 2/3 — focus on hardest spiral/irregular examples
-    ohem_loss = OHEMBinaryLoss(
-        keep_ratio=config.ohem_keep_ratio,
-        label_smoothing=config.label_smoothing,
-    )
-
-    # Adjust batch sizes for larger Stage 2 models (P100 16GB VRAM)
-    bs_p1 = config.batch_size_phase1
-    if architecture == 'ConvNeXtTiny':
-        bs_p2 = 16  # ConvNeXtTiny is heavier than EfficientNet
-        bs_p3 = 12
-    elif architecture == 'EfficientNetV2B2':
-        bs_p2 = 24
-        bs_p3 = config.batch_size_phase3
-    else:
-        bs_p2 = config.batch_size_phase2
-        bs_p3 = config.batch_size_phase3
-
-    model, base_model = build_stage2_model(architecture=architecture)
-
-    # ── Phase 1: Warmup @ 128px — Standard BCE for stability ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
-    freeze_base(base_model)
-
-    train_ds = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase1, bs_p1, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage2(
-        s2_val, config.image_size_phase1, bs_p1, config,
-    )
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(config.stage2_warmup_lr, clipnorm=1.0),
-        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for Phase 1
-        metrics=_binary_metrics(),
-    )
-
-    h1 = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=config.stage2_warmup_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / f'{model_tag}_phase1.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
-            ),
-            ConciseLogging(),
-        ],
-        verbose=0,
-    )
-
-    # ── Phase 2: Mid-tune @ 192px ──
-    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze last {config.stage2_unfreeze_phase2})')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage2_unfreeze_phase2)
-    print(f'  Unfrozen layers: {n_unfrozen}')
-
-    train_ds = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase2, bs_p2, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage2(
-        s2_val, config.image_size_phase2, bs_p2, config,
-    )
-
-    lr_schedule_p2 = tf.keras.optimizers.schedules.CosineDecay(
-        config.stage2_midtune_lr,
-        decay_steps=config.stage2_midtune_epochs * (len(s2_train) // bs_p2),
-    )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 2
-        metrics=_binary_metrics(),
-    )
-
-    h2 = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=config.stage2_midtune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / f'{model_tag}_phase2.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
-            ),
-            ConciseLogging(),
-        ],
-        verbose=0,
-    )
-
-    # ── Phase 3: Full fine-tune @ 224px with SGDR ──
-    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze last {config.stage2_unfreeze_phase3})')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage2_unfreeze_phase3)
-    print(f'  Unfrozen layers: {n_unfrozen}')
-
-    steps_per_epoch_p3 = len(s2_train) // bs_p3
-    lr_schedule_p3 = build_cosine_restart_schedule(
-        config.stage2_finetune_lr, steps_per_epoch_p3,
-        restart_epochs=5, t_mul=1.5, m_mul=0.9,
-    )
-
-    train_ds = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase3, bs_p3, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage2(
-        s2_val, config.image_size_phase3, bs_p3, config,
-    )
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 3
-        metrics=_binary_metrics(),
-    )
-
-    h3 = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=config.stage2_finetune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / f'{model_tag}_best.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=8, restore_best_weights=True,
-            ),
-            ConciseLogging(),
-        ],
-        verbose=0,
-    )
-
-    # ── SWA for Stage 2 ──
-    print(f'\n[{model_tag} SWA]')
-    train_ds_swa = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase3, bs_p3, config,
-        augment=False, shuffle=True,
-    )
-    model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
-    model.save(str(output_dir / f'{model_tag}_best.keras'))
-
-    # Save history
-    history = {
-        'phase1': h1.history,
-        'phase2': h2.history,
-        'phase3': h3.history,
-    }
-    for phase_key, phase_hist in history.items():
-        for metric_key, values in phase_hist.items():
-            history[phase_key][metric_key] = [float(v) for v in values]
-
-    with open(output_dir / f'{model_tag}_history.json', 'w') as f:
-        json.dump(history, f, indent=2)
-
-    print(f'\n[{model_tag}] Training complete. Model saved to {output_dir / f"{model_tag}_best.keras"}')
-
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-
-# ══════════════════════════════════════════════════════════════
-# CASCADE TRAINING ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════
-
-def run_cascade_training(train_df, val_df, config: Config, output_dir: Path) -> dict:
-    """Orchestrate the full cascade training pipeline.
-    
-    Order:
-    1. Train Stage 1 (elliptical binary) on full dataset
-    2. Train Stage 2 models (spiral vs irregular) on non-elliptical subset
-    3. Each stage runs in a separate subprocess for VRAM isolation
-    """
-    import multiprocessing
-
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
-    config_dict = asdict(config)
-    output_dir_str = str(output_dir)
-    train_df_dict = train_df.to_dict()
-    val_df_dict = val_df.to_dict()
-
-    results = {}
-
-    # ── 1. Train Stage 1 ──
-    print('\n' + '=' * 70)
-    print('TRAINING STAGE 1: Elliptical vs Non-Elliptical')
-    print('=' * 70)
-    t0 = time.time()
-
-    p = multiprocessing.Process(
-        target=_train_stage1_isolated,
-        args=(train_df_dict, val_df_dict, config_dict, output_dir_str),
-    )
-    p.start()
-    p.join()
-
-    if p.exitcode != 0:
-        raise RuntimeError(f'Stage 1 training failed with exit code {p.exitcode}')
-
-    stage1_time = time.time() - t0
-    print(f'\nStage 1 completed in {stage1_time / 60:.1f} minutes')
-
-    with open(output_dir / 'stage1_history.json', 'r') as f:
-        results['stage1'] = json.load(f)
-
-    # ── 2. Train Stage 2 (multiple ensemble models) ──
-    print('\n' + '=' * 70)
-    print('TRAINING STAGE 2: Spiral vs Irregular (Ensemble)')
-    print('=' * 70)
-
-    stage2_results = {}
-    for i, (arch, seed) in enumerate(zip(config.stage2_architectures, config.stage2_seeds)):
-        model_tag = f'stage2_{arch}_seed{seed}'
-        t0 = time.time()
-
-        p = multiprocessing.Process(
-            target=_train_stage2_isolated,
-            args=(
-                train_df_dict, val_df_dict, config_dict, output_dir_str,
-                arch, seed, model_tag,
-            ),
-        )
-        p.start()
-        p.join()
-
-        if p.exitcode != 0:
-            raise RuntimeError(f'Stage 2 [{model_tag}] training failed with exit code {p.exitcode}')
-
-        stage2_time = time.time() - t0
-        print(f'\n{model_tag} completed in {stage2_time / 60:.1f} minutes')
-
-        with open(output_dir / f'{model_tag}_history.json', 'r') as f:
-            stage2_results[model_tag] = json.load(f)
-
-    results['stage2'] = stage2_results
-
-    return results
-
-
-# ══════════════════════════════════════════════════════════════
-# FALLBACK — RE-TRAIN STAGE 2 WITH RELAXED THRESHOLDS
-# ══════════════════════════════════════════════════════════════
-
-def run_stage2_fallback(train_df, val_df, config: Config, output_dir: Path) -> dict:
-    """Re-train Stage 2 with relaxed thresholds and stronger regularization.
-    
-    Triggered automatically if irregular_f1 < 0.75 after initial training.
-    """
-    import multiprocessing
-
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
-    print('\n' + '!' * 70)
-    print('FALLBACK: Re-training Stage 2 with relaxed thresholds')
-    print('!' * 70)
-
-    # Apply fallback config changes
-    config_dict = asdict(config)
-    config_dict['stage2_focal_gamma'] = config.fallback_stage2_focal_gamma
-
-    output_dir_str = str(output_dir)
-    train_df_dict = train_df.to_dict()
-    val_df_dict = val_df.to_dict()
-
-    stage2_results = {}
-    for i, (arch, seed) in enumerate(zip(config.stage2_architectures, config.stage2_seeds)):
-        model_tag = f'stage2_{arch}_seed{seed}_fallback'
-
-        p = multiprocessing.Process(
-            target=_train_stage2_isolated,
-            args=(
-                train_df_dict, val_df_dict, config_dict, output_dir_str,
-                arch, seed, model_tag,
-            ),
-        )
-        p.start()
-        p.join()
-
-        if p.exitcode != 0:
-            print(f'WARNING: Fallback {model_tag} failed with exit code {p.exitcode}')
-            continue
-
-        with open(output_dir / f'{model_tag}_history.json', 'r') as f:
-            stage2_results[model_tag] = json.load(f)
-
-    return stage2_results
-
-
-# ══════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ══════════════════════════════════════════════════════════════
 
 def main():
+    t0 = time.time()
     config = Config()
 
-    if config.enable_mixed_precision:
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
-        print(f'Mixed precision enabled: {policy.name}')
-
-    output_dir = config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    setup_environment(config)
-
-    # ── Dataset setup ──
     if is_kaggle_runtime():
+        print("Running in Kaggle environment.")
         solutions_csv, image_dir = setup_kaggle_environment(config)
-        labels_csv = output_dir / 'labels.csv'
     else:
-        solutions_csv = Path('training_solutions_rev1.csv')
-        image_dir = Path('images')
-        labels_csv = output_dir / 'labels.csv'
+        print("Running in local/VM environment.")
+        setup_environment(config)
+        solutions_csv = Path("training_solutions_rev1.csv")
+        image_dir = Path("images_training_rev1")
 
-    # Always regenerate labels with V25 thresholds
-    labels_df = generate_labels_df(solutions_csv, image_dir, config)
-    labels_df.to_csv(labels_csv, index=False)
-
-    # Validate class counts
-    validate_class_counts(labels_df, config)
-
-    # Split data
-    class_counts, split_info, (train_df, val_df, test_df) = build_datasets(labels_df, config)
-
-    print('\n=== Dataset Split ===')
-    print(f'  Train: {len(train_df)}')
-    print(f'  Val:   {len(val_df)}')
-    print(f'  Test:  {len(test_df)}')
-    print(f'  Class distribution: {class_counts}')
-
-    # ── Run cascade training ──
-    start_time = time.time()
-    training_results = run_cascade_training(train_df, val_df, config, output_dir)
-    total_train_time = time.time() - start_time
-    print(f'\nTotal training time: {total_train_time / 60:.1f} minutes')
-
-    # ── Evaluate cascade pipeline ──
-    print('\n' + '=' * 70)
-    print('CASCADE EVALUATION')
-    print('=' * 70)
-
-    # Collect Stage 2 model paths
-    stage2_model_paths = []
-    for arch, seed in zip(config.stage2_architectures, config.stage2_seeds):
-        tag = f'stage2_{arch}_seed{seed}'
-        model_path = output_dir / f'{tag}_best.keras'
-        if model_path.exists():
-            stage2_model_paths.append(str(model_path))
-
-    eval_results = evaluate_cascade(
-        stage1_model_path=str(output_dir / 'stage1_best.keras'),
-        stage2_model_paths=stage2_model_paths,
-        test_df=test_df,
-        val_df=val_df,
-        config=config,
-        output_dir=output_dir,
-    )
-
-    # ── V26: XGBoost Stacking ──
-    if config.use_xgboost_stacking:
-        print('\n' + '=' * 70)
-        print('V26: XGBOOST META-LEARNER STACKING')
-        print('=' * 70)
-
-        from stacking import extract_features, train_xgboost_stacker, predict_with_stacker
-
-        # Collect ALL model paths for feature extraction
-        all_model_paths = [str(output_dir / 'stage1_best.keras')] + stage2_model_paths
-
-        print('\n[Stacking] Extracting deep features...')
-        train_features = extract_features(all_model_paths, train_df, config)
-        val_features = extract_features(all_model_paths, val_df, config)
-        test_features = extract_features(all_model_paths, test_df, config)
-
-        train_labels = train_df['label_id'].to_numpy()
-        val_labels = val_df['label_id'].to_numpy()
-        test_labels = test_df['label_id'].to_numpy()
-
-        xgb_model = train_xgboost_stacker(
-            train_features, train_labels,
-            val_features, val_labels,
-            config,
-            output_path=output_dir / 'xgb_stacker.pkl',
-        )
-
-        # Evaluate stacked model on test set
-        xgb_preds, xgb_probs = predict_with_stacker(xgb_model, test_features)
-        xgb_acc = float(np.mean(xgb_preds == test_labels))
-        print(f'\n[Stacking] XGBoost Test Accuracy: {xgb_acc:.4f}')
-
-        # Store stacking results in eval_results
-        eval_results['xgboost_stacking'] = {
-            'test_accuracy': xgb_acc,
-            'feature_dim': train_features.shape[1],
-            'n_models': len(all_model_paths),
-        }
-
-    # ── Check if fallback is needed ──
-    irregular_f1 = eval_results.get('cascade_evaluation', {}).get(
-        'classification_report', {}
-    ).get('irregular', {}).get('f1-score', 0.0)
-
-    fallback_triggered = False
-    if irregular_f1 < 0.75:
-        print(f'\n⚠️ Irregular F1 = {irregular_f1:.4f} < 0.75 — triggering Stage 2 fallback!')
-        fallback_triggered = True
-
-        fallback_results = run_stage2_fallback(train_df, val_df, config, output_dir)
-
-        # Re-evaluate with fallback models
-        fallback_model_paths = []
-        for arch, seed in zip(config.stage2_architectures, config.stage2_seeds):
-            tag = f'stage2_{arch}_seed{seed}_fallback'
-            model_path = output_dir / f'{tag}_best.keras'
-            if model_path.exists():
-                fallback_model_paths.append(str(model_path))
-
-        if fallback_model_paths:
-            eval_results_fallback = evaluate_cascade(
-                stage1_model_path=str(output_dir / 'stage1_best.keras'),
-                stage2_model_paths=fallback_model_paths,
-                test_df=test_df,
-                val_df=val_df,
-                config=config,
-                output_dir=output_dir,
-            )
-            # Use fallback results if better
-            fallback_irr_f1 = eval_results_fallback.get('cascade_evaluation', {}).get(
-                'classification_report', {}
-            ).get('irregular', {}).get('f1-score', 0.0)
-            if fallback_irr_f1 > irregular_f1:
-                eval_results = eval_results_fallback
-                eval_results['fallback_triggered'] = True
-
-    # ── Compile final metrics ──
-    import datetime
-
-    final_metrics = {
-        'run_id': 'v25_cascade_224px',
-        'timestamp': datetime.datetime.now().isoformat(),
-        'training_time_minutes': total_train_time / 60,
-        'dataset': split_info,
-        'stage1': {
-            'architecture': config.stage1_architecture,
-            'image_size_phases': [config.image_size_phase1, config.image_size_phase2, config.image_size_phase3],
-            'model_path': str(output_dir / 'stage1_best.keras'),
-            'training_history': training_results.get('stage1', {}),
-        },
-        'stage2': {
-            'architectures': [f'{a}_seed{s}' for a, s in zip(config.stage2_architectures, config.stage2_seeds)],
-            'image_size_phases': [config.image_size_phase1, config.image_size_phase2, config.image_size_phase3],
-            'model_paths': stage2_model_paths,
-            'training_history': training_results.get('stage2', {}),
-        },
-        'cascade_evaluation': eval_results.get('cascade_evaluation', {}),
-        'swa_applied': True,
-        'tta_n_augments': config.tta_n_augments,
-        'fallback_triggered': fallback_triggered,
-    }
-
-    save_json(output_dir / 'metrics.json', final_metrics)
-
-    # ── Final report ──
-    cascade_eval = eval_results.get('cascade_evaluation', {})
-    print('\n' + '=' * 60)
-    print('FINAL RESULTS — GalaxyNet V25 Cascade Pipeline')
-    print('=' * 60)
-    print(f"  Test Accuracy (standard): {cascade_eval.get('test_accuracy_standard', 'N/A')}")
-    print(f"  Test Accuracy (TTA-16):   {cascade_eval.get('test_accuracy_tta', 'N/A')}")
-    print(f"  Cohen's Kappa:            {cascade_eval.get('cohen_kappa', 'N/A')}")
-    print(f"  Matthews CorrCoef:        {cascade_eval.get('matthews_corrcoef', 'N/A')}")
-
-    report = cascade_eval.get('classification_report', {})
-    print(f"\n  Per-class F1:")
-    for cls in CLASS_NAMES:
-        cls_data = report.get(cls, {})
-        print(f"    {cls:>12s}: P={cls_data.get('precision', 0):.4f}  R={cls_data.get('recall', 0):.4f}  F1={cls_data.get('f1-score', 0):.4f}")
-
-    targets = cascade_eval.get('min_targets_met', {})
-    print(f"\n  Acceptance Criteria:")
-    for key, met in targets.items():
-        status = '✓' if met else '✗'
-        print(f"    {status} {key}: {'PASS' if met else 'FAIL'}")
-
-    print(f"\n  Fallback triggered: {fallback_triggered}")
-    print(f"  All outputs saved to: {output_dir}")
-    print('=' * 60)
+    # Pipeline
+    test_df, target_cols = train_unified_regression(config, solutions_csv, image_dir)
+    
+    print(f"\nTraining pipeline completed in {(time.time() - t0) / 60:.1f} minutes.")
+    
+    # Run evaluation
+    evaluate_regression(config, test_df, target_cols)
 
 
 if __name__ == '__main__':

@@ -66,13 +66,13 @@ class Config:
     # ── Image resolution curriculum ────────────────────────────
     image_size_phase1: int = 128
     image_size_phase2: int = 192
-    image_size_phase3: int = 288   # Upgraded to 288px for final precision
+    image_size_phase3: int = 288
     center_crop_ratio: float = 0.75
 
     # ── Batch sizes (per phase, tuned for P100 16GB) ───────────
-    batch_size_phase1: int = 64    # 128px fits large batches
-    batch_size_phase2: int = 32    # 192px
-    batch_size_phase3: int = 16    # 224px (use grad accumulation if needed)
+    batch_size_phase1: int = 64
+    batch_size_phase2: int = 32
+    batch_size_phase3: int = 16
     grad_accumulation_steps: int = 2  # effective batch = 32 at phase3
 
     # ── Data split ─────────────────────────────────────────────
@@ -80,64 +80,32 @@ class Config:
     val_split: float = 0.15
     test_split: float = 0.15
 
-    # ── Label thresholds (TIGHTENED from V24) ──────────────────
-    elliptical_threshold: float = 0.469  # unchanged (high consensus)
-    spiral_disk_threshold: float = 0.450  # tightened from 0.430
-    spiral_arms_threshold: float = 0.450  # tightened from 0.430
-    irregular_threshold: float = 0.500   # tightened from 0.469
-    irregular_margin: float = 0.15       # tightened from 0.10
+    # ── Model Architecture ─────────────────────────────────────
+    architecture: str = 'EfficientNetV2B2'
 
-    # ── Soft Labels (V26) ──────────────────────────────────────
-    use_soft_labels: bool = True    # Regress crowd-sourced voting fractions
-    # When True, Stage 1 label = Class1.1 (P(elliptical)),
-    # Stage 2 label = normalized spiral confidence
+    # ── Training Schedule ──────────────────────────────────────
+    warmup_epochs: int = 12
+    midtune_epochs: int = 10
+    finetune_epochs: int = 25
 
-    # ── Stage 1 training (elliptical binary) ───────────────────
-    stage1_architecture: str = 'EfficientNetV2B1'
-    stage1_warmup_epochs: int = 12
-    stage1_midtune_epochs: int = 10
-    stage1_finetune_epochs: int = 20
-    stage1_warmup_lr: float = 3e-4
-    stage1_midtune_lr: float = 3e-5
-    stage1_finetune_lr: float = 8e-6
-    stage1_unfreeze_phase2: int = 50  # unfreeze last 50 layers for phase 2
-    stage1_unfreeze_phase3: int = 80  # unfreeze last 80 layers for phase 3
+    warmup_lr: float = 3e-4
+    midtune_lr: float = 3e-5
+    finetune_lr: float = 8e-6
 
-    # ── Stage 2 training (spiral vs irregular binary) ──────────
-    stage2_architectures: Tuple[str, ...] = ('EfficientNetV2B2', 'EfficientNetV2B1', 'ConvNeXtTiny')
-    stage2_seeds: Tuple[int, ...] = (42, 123, 77)
-    stage2_warmup_epochs: int = 12
-    stage2_midtune_epochs: int = 10
-    stage2_finetune_epochs: int = 25
-    stage2_warmup_lr: float = 3e-4
-    stage2_midtune_lr: float = 3e-5
-    stage2_finetune_lr: float = 8e-6
-    stage2_unfreeze_phase2: int = 50
-    stage2_unfreeze_phase3: int = 80
-    # Stage 1 confidence threshold for filtering training data into Stage 2
-    stage1_filter_confidence: float = 0.85
-
-    # ── Focal loss ─────────────────────────────────────────────
-    stage1_focal_gamma: float = 2.0   # Standard gamma for stable discrimination
-    stage2_focal_gamma: float = 1.5   # moderate focus on hard examples
-    label_smoothing: float = 0.05
-
-    # ── OHEM (V26) ─────────────────────────────────────────────
-    ohem_keep_ratio: float = 0.70     # Keep top 70% hardest examples
-    ohem_start_phase: int = 2         # Only enable in Phase 2+ (not warmup)
+    unfreeze_phase2: int = 50
+    unfreeze_phase3: int = 80
 
     # ── Augmentation ───────────────────────────────────────────
-    mixup_alpha: float = 0.4          # Beta distribution parameter
-    mixup_prob_irregular: float = 0.5  # apply mixup to 50% of irregular batches
-    cutout_n_holes_irregular: int = 3
-    cutout_n_holes_other: int = 1
+    mixup_alpha: float = 0.4
+    mixup_prob: float = 0.5
+    cutout_n_holes: int = 2
     cutout_max_size_ratio: float = 0.20
 
     # ── Astronomy-Specific Augmentations (V26) ─────────────────
-    augment_poisson_scale: float = 25.0   # Poisson noise intensity (higher = less noise)
-    augment_poisson_prob: float = 0.3     # Probability of applying Poisson noise
-    augment_blur_prob: float = 0.2        # Probability of applying PSF blur
-    augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)  # Gaussian blur sigma range
+    augment_poisson_scale: float = 25.0   # higher = less noise
+    augment_poisson_prob: float = 0.3
+    augment_blur_prob: float = 0.2
+    augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)
 
     # ── SWA ────────────────────────────────────────────────────
     swa_epochs: int = 5
@@ -149,24 +117,6 @@ class Config:
 
     # ── Runtime ────────────────────────────────────────────────
     enable_mixed_precision: bool = True
-    use_sample_weighting: bool = True
-
-    # ── XGBoost Stacking (V26) ─────────────────────────────────
-    use_xgboost_stacking: bool = True
-    xgb_n_estimators: int = 300
-    xgb_max_depth: int = 6
-    xgb_learning_rate: float = 0.05
-
-    # ── Minimum class counts after threshold tightening ────────
-    min_irregular_count: int = 3000
-    min_spiral_count: int = 10000
-    min_elliptical_count: int = 18000
-
-    # ── Fallback params (triggered if irregular_f1 < 0.75) ────
-    fallback_irregular_threshold: float = 0.469
-    fallback_irregular_margin: float = 0.10
-    fallback_stage2_focal_gamma: float = 3.0
-    fallback_pos_weight_multiplier: float = 1.5
 
 
 # ============================================================
@@ -462,213 +412,30 @@ def run_swa(
 # ============================================================
 
 
-
+@tf.keras.utils.register_keras_serializable(package="Custom")
+def rmse_metric(y_true, y_pred):
+    """Root Mean Squared Error for the 37 regression targets."""
+    mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
+    return tf.maximum(0.0, tf.sqrt(mse))
 
 @tf.keras.utils.register_keras_serializable(package="Custom")
-class BinaryFocalLoss(tf.keras.losses.Loss):
-    """Binary focal loss for cascade binary classification stages.
+class RMSELoss(tf.keras.losses.Loss):
+    """Direct RMSE loss function instead of standard MSE.
 
-    Focuses learning on hard examples via modulating factor (1-p)^gamma.
-    Supports pos_weight for class imbalance and label smoothing.
-
-    Args:
-        gamma: Focusing parameter. Higher values focus more on hard examples.
-               Stage 1 (easy): 1.5, Stage 2 (hard): 2.5
-        pos_weight: Weight for positive class. Set to n_neg/n_pos for imbalance.
-        label_smoothing: Smooth labels to reduce overconfidence on noisy labels.
+    Can be used directly to optimize against the Kaggle LB metric.
+    Includes a small epsilon inside the square root for numerical stability.
     """
-
-    def __init__(
-        self,
-        gamma: float = 2.0,
-        pos_weight: float = 1.0,
-        label_smoothing: float = 0.0,
-        name: str = 'binary_focal_loss',
-        **kwargs,
-    ):
+    def __init__(self, name="rmse_loss", **kwargs):
         super().__init__(name=name, **kwargs)
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-        self.label_smoothing = label_smoothing
 
     def call(self, y_true, y_pred):
-        # Ensure matching shapes to prevent unintended broadcasting [batch, batch]
-        y_pred = tf.cast(y_pred, tf.float32)
-        y_true = tf.cast(tf.reshape(y_true, tf.shape(y_pred)), tf.float32)
-
-        # Label smoothing
-        if self.label_smoothing > 0:
-            y_true = y_true * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
-
-        # Clip predictions for numerical stability
-        epsilon = tf.keras.backend.epsilon()
-        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
-
-        # Binary cross entropy components
-        bce_pos = -y_true * tf.math.log(y_pred)
-        bce_neg = -(1.0 - y_true) * tf.math.log(1.0 - y_pred)
-
-        # Focal modulation weights
-        focal_weight_pos = tf.pow(1.0 - y_pred, self.gamma)
-        focal_weight_neg = tf.pow(y_pred, self.gamma)
-
-        # Apply pos_weight for class imbalance
-        loss = self.pos_weight * focal_weight_pos * bce_pos + focal_weight_neg * bce_neg
-
-        return tf.reduce_mean(loss, axis=-1)
+        # Calculate MSE across the 37 features
+        mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
+        # Apply sqrt with epsilon to prevent infinite gradient at exactly 0.0 variance
+        return tf.sqrt(tf.maximum(mse, tf.keras.backend.epsilon()))
 
     def get_config(self):
-        config = super().get_config()
-        config.update({
-            'gamma': self.gamma,
-            'pos_weight': self.pos_weight,
-            'label_smoothing': self.label_smoothing,
-        })
-        return config
-
-
-class CategoricalFocalLoss(tf.keras.losses.Loss):
-    """Categorical focal loss (kept for backwards compatibility and potential fallback).
-
-    Multi-class focal loss with per-class alpha weighting and label smoothing.
-    """
-
-    def __init__(
-        self,
-        alpha: list[float] | None = None,
-        gamma: float = 2.0,
-        label_smoothing: float = 0.0,
-        name: str = 'categorical_focal_loss',
-        **kwargs,
-    ):
-        super().__init__(name=name, **kwargs)
-        self.alpha = alpha
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-
-    def call(self, y_true, y_pred):
-        # Ensure float32 for mixed precision
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-
-        if self.label_smoothing > 0:
-            num_classes = tf.cast(tf.shape(y_true)[-1], tf.float32)
-            y_true = y_true * (1.0 - self.label_smoothing) + (self.label_smoothing / num_classes)
-
-        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
-
-        # Categorical cross entropy core
-        cross_entropy = -y_true * tf.math.log(y_pred)
-
-        # Focal weight: (1 - p)^gamma
-        weight = tf.pow(1.0 - y_pred, self.gamma)
-        loss = weight * cross_entropy
-
-        # Class balanced alpha scaling
-        if self.alpha is not None:
-            alpha = tf.constant(self.alpha, dtype=tf.float32)
-            loss = alpha * loss
-
-        return tf.reduce_sum(loss, axis=-1)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'alpha': self.alpha,
-            'gamma': self.gamma,
-            'label_smoothing': self.label_smoothing,
-        })
-        return config
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class OHEMBinaryLoss(tf.keras.losses.Loss):
-    """Online Hard Example Mining loss for binary classification.
-
-    Computes per-sample binary cross entropy, then only keeps the top-K%
-    hardest examples (highest loss) for gradient computation. Easy examples
-    that the model already classifies correctly are discarded.
-
-    This forces the optimizer to spend 100% of its gradient budget on the
-    confusing boundary cases (e.g., ambiguous spiral/irregular galaxies).
-
-    Args:
-        keep_ratio: Fraction of hardest examples to keep (0.7 = top 70%).
-        label_smoothing: Optional label smoothing factor.
-    """
-
-    def __init__(
-        self,
-        keep_ratio: float = 0.70,
-        label_smoothing: float = 0.0,
-        name: str = 'ohem_binary_loss',
-        **kwargs,
-    ):
-        super().__init__(name=name, reduction='none', **kwargs)
-        self.keep_ratio = keep_ratio
-        self.label_smoothing = label_smoothing
-
-    def call(self, y_true, y_pred):
-        y_pred = tf.cast(y_pred, tf.float32)
-        y_true = tf.cast(tf.reshape(y_true, tf.shape(y_pred)), tf.float32)
-
-        if self.label_smoothing > 0:
-            y_true = y_true * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
-
-        epsilon = tf.keras.backend.epsilon()
-        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
-
-        # Per-sample binary cross entropy
-        bce = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
-        bce = tf.reduce_mean(bce, axis=-1)  # [batch_size]
-
-        # Keep only the top-K% hardest examples
-        batch_size = tf.shape(bce)[0]
-        k = tf.maximum(tf.cast(tf.cast(batch_size, tf.float32) * self.keep_ratio, tf.int32), 1)
-
-        # Get top-k losses
-        top_k_losses, _ = tf.math.top_k(bce, k=k, sorted=False)
-
-        return tf.reduce_mean(top_k_losses)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'keep_ratio': self.keep_ratio,
-            'label_smoothing': self.label_smoothing,
-        })
-        return config
-
-
-# Backwards compatibility alias
-FocalLoss = CategoricalFocalLoss
-
-# ══════════════════════════════════════════════════════════════
-# CUSTOM METRICS FOR SOFT LABELS
-# ══════════════════════════════════════════════════════════════
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class SoftBinaryAccuracy(tf.keras.metrics.BinaryAccuracy):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
-        return super().update_state(y_true_bin, y_pred, sample_weight)
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class SoftAUC(tf.keras.metrics.AUC):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
-        return super().update_state(y_true_bin, y_pred, sample_weight)
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class SoftPrecision(tf.keras.metrics.Precision):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
-        return super().update_state(y_true_bin, y_pred, sample_weight)
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class SoftRecall(tf.keras.metrics.Recall):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_bin = tf.cast(y_true >= 0.5, tf.float32)
-        return super().update_state(y_true_bin, y_pred, sample_weight)
+        return super().get_config()
 
 
 # ============================================================
@@ -698,75 +465,37 @@ def _get_backbone(architecture: str, input_tensor: tf.Tensor) -> tf.keras.Model:
     )
 
 
-def build_stage1_model(
-    architecture: str = 'EfficientNetV2B1',
-) -> tuple[tf.keras.Model, tf.keras.Model]:
-    """Build Stage 1 binary classifier: Elliptical vs Non-Elliptical.
-
-    Architecture: backbone → GAP → BN → Dense(256) → BN → ReLU →
-                  Dropout(0.35) → Dense(1, sigmoid)
-
-    Returns:
-        (full_model, base_model) tuple for progressive unfreezing.
-    """
-    # Dynamic input shape for resolution curriculum
-    inputs = tf.keras.Input(shape=(None, None, 3), name='stage1_input')
-    base_model = _get_backbone(architecture, inputs)
-
-    x = tf.keras.layers.GlobalAveragePooling2D(name='stage1_gap')(base_model.output)
-    x = tf.keras.layers.BatchNormalization(name='stage1_bn1')(x)
-    x = tf.keras.layers.Dense(256, name='stage1_dense1')(x)
-    x = tf.keras.layers.BatchNormalization(name='stage1_bn2')(x)
-    x = tf.keras.layers.Activation('relu', name='stage1_relu')(x)
-    x = tf.keras.layers.Dropout(0.35, name='stage1_dropout')(x)
-    # Sigmoid output for binary classification, float32 for mixed precision
-    outputs = tf.keras.layers.Dense(
-        1, activation='sigmoid', dtype='float32', name='stage1_output'
-    )(x)
-
-    model = tf.keras.Model(
-        inputs=inputs, outputs=outputs,
-        name=f'GalaxyNet_Stage1_{architecture}',
-    )
-    return model, base_model
-
-
-def build_stage2_model(
+def build_regression_model(
     architecture: str = 'EfficientNetV2B2',
 ) -> tuple[tf.keras.Model, tf.keras.Model]:
-    """Build Stage 2 binary classifier: Spiral vs Irregular.
+    """Build unified regression model: Predicts all 37 Galaxy Zoo probabilities.
 
     Architecture: backbone → GAP → BN → Dense(512) → BN → GELU →
-                  Dropout(0.4) → Dense(256) → BN → GELU →
-                  Dropout(0.3) → Dense(1, sigmoid)
+                  Dropout(0.4) → Dense(37, sigmoid)
 
-    Deeper head than Stage 1 because spiral/irregular boundary is harder.
-    GELU activation for smoother gradients on the difficult boundary.
+    Using Sigmoid on the final layer logically bounds all voting fractions to [0.0, 1.0].
 
     Returns:
         (full_model, base_model) tuple for progressive unfreezing.
     """
-    inputs = tf.keras.Input(shape=(None, None, 3), name='stage2_input')
+    inputs = tf.keras.Input(shape=(None, None, 3), name='image_input')
     base_model = _get_backbone(architecture, inputs)
 
-    x = tf.keras.layers.GlobalAveragePooling2D(name='stage2_gap')(base_model.output)
-    x = tf.keras.layers.BatchNormalization(name='stage2_bn1')(x)
-    x = tf.keras.layers.Dense(512, name='stage2_dense1')(x)
-    x = tf.keras.layers.BatchNormalization(name='stage2_bn2')(x)
-    x = tf.keras.layers.Activation('gelu', name='stage2_gelu1')(x)
-    x = tf.keras.layers.Dropout(0.4, name='stage2_dropout1')(x)
-    x = tf.keras.layers.Dense(256, name='stage2_dense2')(x)
-    x = tf.keras.layers.BatchNormalization(name='stage2_bn3')(x)
-    x = tf.keras.layers.Activation('gelu', name='stage2_gelu2')(x)
-    x = tf.keras.layers.Dropout(0.3, name='stage2_dropout2')(x)
-    # Sigmoid output for binary classification
+    x = tf.keras.layers.GlobalAveragePooling2D(name='gap')(base_model.output)
+    x = tf.keras.layers.BatchNormalization(name='bn1')(x)
+    x = tf.keras.layers.Dense(512, name='dense1')(x)
+    x = tf.keras.layers.BatchNormalization(name='bn2')(x)
+    x = tf.keras.layers.Activation('gelu', name='gelu1')(x)
+    x = tf.keras.layers.Dropout(0.4, name='dropout1')(x)
+
+    # 37 dimensional output bounded to [0, 1] interval natively using sigmoid
     outputs = tf.keras.layers.Dense(
-        1, activation='sigmoid', dtype='float32', name='stage2_output'
+        37, activation='sigmoid', dtype='float32', name='regression_output'
     )(x)
 
     model = tf.keras.Model(
         inputs=inputs, outputs=outputs,
-        name=f'GalaxyNet_Stage2_{architecture}',
+        name=f'GalaxyNet_UnifiedRegression_{architecture}',
     )
     return model, base_model
 
@@ -804,104 +533,27 @@ def freeze_base(base_model: tf.keras.Model) -> None:
 
 
 
-CLASS_NAMES = ['spiral', 'elliptical', 'irregular']
-CLASS_TO_ID = {name: idx for idx, name in enumerate(CLASS_NAMES)}
-
-# Binary label mappings for cascade stages
-STAGE1_CLASSES = ['non_elliptical', 'elliptical']  # 0=non_elliptical, 1=elliptical
-STAGE2_CLASSES = ['irregular', 'spiral']            # 0=irregular, 1=spiral
-
 
 # ══════════════════════════════════════════════════════════════
-# LABEL DETERMINATION (tightened for V25)
+# LABEL DETERMINATION (Regression - 37 Targets)
 # ══════════════════════════════════════════════════════════════
 
-def determine_class(row: pd.Series, config: Config) -> str:
-    """Determine galaxy morphology class using tightened V25 thresholds."""
-    is_elliptical = row['Class1.1'] >= config.elliptical_threshold
-    is_spiral = (row['Class1.2'] >= config.spiral_disk_threshold) and (
-        row['Class4.1'] >= config.spiral_arms_threshold
-    )
-
-    # V25: Tightened irregular label curation
-    # Class 6.1: Yes (Odd), Class 6.2: No (Normal)
-    odd_margin = row['Class6.1'] - row['Class6.2']
-    is_irregular = (
-        row['Class6.1'] >= config.irregular_threshold
-        and odd_margin >= config.irregular_margin
-        and not is_elliptical
-        and not is_spiral
-    )
-
-    if is_elliptical:
-        return 'elliptical'
-    if is_spiral:
-        return 'spiral'
-    if is_irregular:
-        return 'irregular'
-    return 'unknown'
-
-
-def compute_sample_weights(df: pd.DataFrame, label_col: str = 'label_id', n_classes: int = 3) -> np.ndarray:
-    """Computes weights inversely proportional to class frequency."""
-    counts = df[label_col].value_counts().to_dict()
-    total = len(df)
-    weights_map = {cid: total / (n_classes * count) for cid, count in counts.items()}
-    mean_w = np.mean(list(weights_map.values()))
-    weights_map = {cid: w / mean_w for cid, w in weights_map.items()}
-    return df[label_col].map(weights_map).to_numpy()
-
-
-def generate_labels_df(solutions_csv: Path, image_dir: Path, config: Config) -> pd.DataFrame:
-    """Generate 3-class labels DataFrame from Galaxy Zoo solutions CSV.
-
-    V26: Also preserves raw voting fractions for soft label training.
-    """
+def generate_labels_df(solutions_csv: Path, image_dir: Path) -> pd.DataFrame:
+    """Generate 37-target DataFrame from Galaxy Zoo solutions CSV for Regression."""
     df = pd.read_csv(solutions_csv)
-    required_cols = {'GalaxyID', 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2'}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f'Missing required columns in {solutions_csv}: {sorted(missing)}')
 
-    df['label'] = df.apply(lambda r: determine_class(r, config), axis=1)
-    df = df[df['label'] != 'unknown'].copy()
+    # Automatically extract all 37 Class probability columns
+    target_cols = [col for col in df.columns if col.startswith('Class')]
+    if len(target_cols) != 37:
+        print(f"WARNING: Expected 37 Class columns, found {len(target_cols)}")
+
     df['image_path'] = df['GalaxyID'].astype(str).apply(lambda gid: str(image_dir / f'{gid}.jpg'))
+
+    # Check physical file existence to prune missing downloads
     df = df[df['image_path'].apply(lambda p: Path(p).exists())].copy()
-    df['label_id'] = df['label'].map(CLASS_TO_ID)
 
-    # V26: Preserve raw voting fractions for soft label training
-    keep_cols = ['GalaxyID', 'image_path', 'label', 'label_id',
-                 'Class1.1', 'Class1.2', 'Class4.1', 'Class6.1', 'Class6.2']
-    return df[keep_cols]
-
-
-def validate_class_counts(labels_df: pd.DataFrame, config: Config) -> None:
-    """Validate minimum class counts after threshold tightening."""
-    counts = labels_df['label'].value_counts()
-    print('\n=== Class Distribution After V25 Threshold Tightening ===')
-    for cls_name in CLASS_NAMES:
-        cnt = counts.get(cls_name, 0)
-        print(f'  {cls_name:>12s}: {cnt:>6d}')
-    print(f'  {"TOTAL":>12s}: {len(labels_df):>6d}\n')
-
-    min_counts = {
-        'irregular': config.min_irregular_count,
-        'spiral': config.min_spiral_count,
-        'elliptical': config.min_elliptical_count,
-    }
-    for cls_name, min_count in min_counts.items():
-        actual = counts.get(cls_name, 0)
-        if actual < min_count:
-            print(f'WARNING: {cls_name} count ({actual}) below minimum ({min_count}). '
-                  f'Consider relaxing threshold by 0.02.')
-
-
-def compute_alpha_from_counts(class_counts: dict[str, int]) -> list[float]:
-    counts = np.array([class_counts.get(c, 1) for c in CLASS_NAMES], dtype=np.float64)
-    total = counts.sum()
-    alpha = total / (len(CLASS_NAMES) * counts)
-    alpha = alpha / alpha.sum()
-    return alpha.tolist()
+    keep_cols = ['image_path'] + target_cols
+    return df[keep_cols], target_cols
 
 
 # ══════════════════════════════════════════════════════════════
@@ -909,7 +561,6 @@ def compute_alpha_from_counts(class_counts: dict[str, int]) -> list[float]:
 # ══════════════════════════════════════════════════════════════
 
 def _center_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
-    """Center crop with configurable ratio (V25: 0.75 for tighter crop at 224px)."""
     h = tf.shape(image)[0]
     w = tf.shape(image)[1]
     ch = tf.cast(tf.cast(h, tf.float32) * ratio, tf.int32)
@@ -920,39 +571,33 @@ def _center_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
 
 
 def load_and_preprocess_image(path: tf.Tensor, label: tf.Tensor, image_size: int,
-                               center_crop_ratio: float = 0.75, weight: tf.Tensor = None):
-    """Load JPEG, center crop, resize to target size."""
+                               center_crop_ratio: float = 0.75):
     img = tf.io.read_file(path)
     img = tf.image.decode_jpeg(img, channels=3)
     img = tf.cast(img, tf.float32)
     img = _center_crop(img, ratio=center_crop_ratio)
     img = tf.image.resize(img, [image_size, image_size])
     img = tf.clip_by_value(img, 0.0, 255.0)
-    if weight is not None:
-        return img, label, weight
     return img, label
 
 
 # ══════════════════════════════════════════════════════════════
-# AUGMENTATION — V25 CLASS-DIFFERENTIATED + MIXUP + CUTOUT
+# AUGMENTATION
 # ══════════════════════════════════════════════════════════════
 
 def apply_cutout(image: tf.Tensor, n_holes: int = 2, max_size_ratio: float = 0.20) -> tf.Tensor:
-    """Apply random square cutouts filled with image mean to force distributed feature learning."""
     shape = tf.shape(image)
     h, w = shape[0], shape[1]
     img_mean = tf.reduce_mean(image)
 
     mask = tf.ones_like(image)
     for _ in range(n_holes):
-        # Random hole size between 5% and max_size_ratio of image
         hole_size_h = tf.random.uniform([], minval=tf.cast(tf.cast(h, tf.float32) * 0.05, tf.int32),
                                          maxval=tf.maximum(tf.cast(tf.cast(h, tf.float32) * max_size_ratio, tf.int32), 2),
                                          dtype=tf.int32)
         hole_size_w = tf.random.uniform([], minval=tf.cast(tf.cast(w, tf.float32) * 0.05, tf.int32),
                                          maxval=tf.maximum(tf.cast(tf.cast(w, tf.float32) * max_size_ratio, tf.int32), 2),
                                          dtype=tf.int32)
-        # Random center position
         cy = tf.random.uniform([], minval=hole_size_h // 2, maxval=h - hole_size_h // 2, dtype=tf.int32)
         cx = tf.random.uniform([], minval=hole_size_w // 2, maxval=w - hole_size_w // 2, dtype=tf.int32)
 
@@ -961,7 +606,6 @@ def apply_cutout(image: tf.Tensor, n_holes: int = 2, max_size_ratio: float = 0.2
         x1 = tf.maximum(cx - hole_size_w // 2, 0)
         x2 = tf.minimum(cx + hole_size_w // 2, w)
 
-        # Create hole mask using padding approach
         top_pad = y1
         bottom_pad = h - y2
         left_pad = x1
@@ -973,35 +617,19 @@ def apply_cutout(image: tf.Tensor, n_holes: int = 2, max_size_ratio: float = 0.2
         hole = tf.pad(hole, [[top_pad, bottom_pad], [left_pad, right_pad], [0, 0]], constant_values=1.0)
         mask = mask * hole
 
-    # Apply mask: replace cutout regions with image mean
     image = image * mask + img_mean * (1.0 - mask)
     return image
 
 
-# ── V26: ASTRONOMY-SPECIFIC AUGMENTATIONS ──
-
 def apply_poisson_noise(image: tf.Tensor, scale: float = 25.0) -> tf.Tensor:
-    """Simulate CCD detector shot noise via Poisson process.
-
-    Real telescope images have photon counting noise proportional to sqrt(signal).
-    Scale controls SNR: higher = less noise (brighter source simulation).
-    """
-    # Normalize to [0, 1], apply Poisson, scale back
     img_norm = image / 255.0
     img_scaled = img_norm * scale
-    # Poisson noise: output has same expected value but with shot noise
     noisy = tf.random.poisson(shape=[], lam=tf.maximum(img_scaled, 1e-6))
     noisy = noisy / scale * 255.0
     return tf.clip_by_value(noisy, 0.0, 255.0)
 
 
 def apply_gaussian_blur(image: tf.Tensor, sigma: float = 1.0) -> tf.Tensor:
-    """Simulate atmospheric PSF (Point Spread Function) via Gaussian blur.
-
-    Real telescope observations are degraded by atmospheric turbulence ('seeing').
-    Sigma controls the blur radius in pixels.
-    """
-    # Build 2D Gaussian kernel
     kernel_size = tf.cast(tf.math.ceil(sigma * 3.0) * 2 + 1, tf.int32)
     kernel_size = tf.maximum(kernel_size, 3)
     half = tf.cast(kernel_size // 2, tf.float32)
@@ -1009,37 +637,25 @@ def apply_gaussian_blur(image: tf.Tensor, sigma: float = 1.0) -> tf.Tensor:
     kernel_1d = tf.exp(-x ** 2 / (2.0 * sigma ** 2))
     kernel_1d = kernel_1d / tf.reduce_sum(kernel_1d)
     kernel_2d = tf.tensordot(kernel_1d, kernel_1d, axes=0)
-    kernel_2d = kernel_2d[:, :, tf.newaxis, tf.newaxis]  # [H, W, 1, 1]
-    kernel_2d = tf.tile(kernel_2d, [1, 1, 3, 1])  # [H, W, 3, 1]
+    kernel_2d = kernel_2d[:, :, tf.newaxis, tf.newaxis]
+    kernel_2d = tf.tile(kernel_2d, [1, 1, 3, 1])
 
-    # Apply depthwise convolution
-    image_4d = tf.expand_dims(image, 0)  # [1, H, W, C]
+    image_4d = tf.expand_dims(image, 0)
     blurred = tf.nn.depthwise_conv2d(image_4d, kernel_2d, strides=[1, 1, 1, 1], padding='SAME')
     return tf.squeeze(blurred, 0)
 
 
 def apply_continuous_rotation(image: tf.Tensor) -> tf.Tensor:
-    """Apply continuous 0-360° rotation (pure TF, no tfa dependency).
-
-    Galaxies have no preferred orientation axis — this is the most
-    physically justified augmentation for astronomical images.
-    """
     if tfa is not None:
         angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
         return tfa.image.rotate(image, angle, interpolation='BILINEAR')
     else:
-        # Pure TF continuous rotation via affine transform
         angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
         cos_a = tf.cos(angle)
         sin_a = tf.sin(angle)
         h = tf.cast(tf.shape(image)[0], tf.float32)
         w = tf.cast(tf.shape(image)[1], tf.float32)
-        # Center-origin affine: translate, rotate, translate back
         cx, cy = w / 2.0, h / 2.0
-        # Inverse transform matrix for tf.raw_ops.ImageProjectiveTransformV3
-        # [a0, a1, a2, b0, b1, b2, c0, c1] where:
-        # x_src = a0*x_dst + a1*y_dst + a2
-        # y_src = b0*x_dst + b1*y_dst + b2
         a2 = cx - cx * cos_a - cy * sin_a
         b2 = cy + cx * sin_a - cy * cos_a
         transform = [cos_a, sin_a, a2, -sin_a, cos_a, b2, 0.0, 0.0]
@@ -1057,130 +673,39 @@ def apply_continuous_rotation(image: tf.Tensor) -> tf.Tensor:
         return tf.squeeze(rotated, 0)
 
 
-def augment_image(image: tf.Tensor, label: tf.Tensor, weight: tf.Tensor = None):
-    """Standard augmentation with V26 astronomy-specific additions."""
+def augment_image(image: tf.Tensor, label: tf.Tensor):
     shape = tf.shape(image)
     orig_h, orig_w = shape[0], shape[1]
 
-    # V26: Continuous rotation (0-360°) — galaxies have no preferred orientation
     image = apply_continuous_rotation(image)
-
     image = tf.image.random_flip_left_right(image)
     image = tf.image.random_flip_up_down(image)
 
-    # V26: Poisson CCD noise (30% probability)
     if tf.random.uniform([]) < 0.3:
         image = apply_poisson_noise(image, scale=25.0)
 
-    # V26: PSF blur — atmospheric seeing simulation (20% probability)
     if tf.random.uniform([]) < 0.2:
         sigma = tf.random.uniform([], 0.5, 2.0)
         image = apply_gaussian_blur(image, sigma)
 
-    # Brightness/contrast (50% probability)
     if tf.random.uniform([]) > 0.5:
         image = tf.image.random_brightness(image, max_delta=0.15 * 255.0)
         image = tf.image.random_contrast(image, lower=0.85, upper=1.15)
 
-    # Random crop 90% and resize back
     crop_h = tf.cast(tf.cast(orig_h, tf.float32) * 0.9, tf.int32)
     crop_w = tf.cast(tf.cast(orig_w, tf.float32) * 0.9, tf.int32)
     image = tf.image.random_crop(image, [crop_h, crop_w, 3])
     image = tf.image.resize(image, [orig_h, orig_w])
 
-    # Cutout (1 hole for standard augmentation)
     if tf.random.uniform([]) > 0.7:
         image = apply_cutout(image, n_holes=1, max_size_ratio=0.15)
 
     image = tf.clip_by_value(image, 0.0, 255.0)
-
-    if weight is not None:
-        return image, label, weight
-    return image, label
-
-
-def augment_image_irregular(image: tf.Tensor, label: tf.Tensor, weight: tf.Tensor = None):
-    """Aggressive augmentation specifically for irregular galaxy class."""
-    shape = tf.shape(image)
-    orig_h, orig_w = shape[0], shape[1]
-
-    if tfa is not None:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        image = tfa.image.rotate(image, angle, interpolation='BILINEAR')
-    else:
-        image = tf.image.rot90(image, k=tf.random.uniform([], 0, 4, dtype=tf.int32))
-
-    image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_flip_up_down(image)
-
-    # Stronger brightness/contrast for irregulars
-    image = tf.image.random_brightness(image, max_delta=0.20 * 255.0)
-    image = tf.image.random_contrast(image, lower=0.80, upper=1.20)
-
-    # Stronger zoom (±15%)
-    crop_h = tf.cast(tf.cast(orig_h, tf.float32) * tf.random.uniform([], 0.85, 0.95), tf.int32)
-    crop_w = tf.cast(tf.cast(orig_w, tf.float32) * tf.random.uniform([], 0.85, 0.95), tf.int32)
-    crop_h = tf.maximum(crop_h, 1)
-    crop_w = tf.maximum(crop_w, 1)
-    image = tf.image.random_crop(image, [crop_h, crop_w, 3])
-    image = tf.image.resize(image, [orig_h, orig_w])
-
-    # Multi-hole cutout for irregulars (3 holes, always applied)
-    image = apply_cutout(image, n_holes=3, max_size_ratio=0.20)
-
-    # Random erasing (20% probability)
-    if tf.random.uniform([]) > 0.8:
-        erase_h = tf.random.uniform([], minval=2, maxval=tf.maximum(orig_h // 6, 3), dtype=tf.int32)
-        erase_w = tf.random.uniform([], minval=2, maxval=tf.maximum(orig_w // 6, 3), dtype=tf.int32)
-        ey = tf.random.uniform([], 0, tf.maximum(orig_h - erase_h, 1), dtype=tf.int32)
-        ex = tf.random.uniform([], 0, tf.maximum(orig_w - erase_w, 1), dtype=tf.int32)
-        noise = tf.random.uniform([erase_h, erase_w, 3], 0.0, 255.0)
-        indices_h = tf.range(ey, ey + erase_h)
-        indices_w = tf.range(ex, ex + erase_w)
-        # Use scatter-nd approach for random erasing
-        y_grid, x_grid = tf.meshgrid(indices_h, indices_w, indexing='ij')
-        coords = tf.stack([tf.reshape(y_grid, [-1]), tf.reshape(x_grid, [-1])], axis=1)
-        flat_noise = tf.reshape(noise, [-1, 3])
-        # Create mask and apply
-        mask = tf.ones([orig_h, orig_w, 1])
-        mask_updates = tf.zeros([tf.shape(coords)[0], 1])
-        mask = tf.tensor_scatter_nd_update(mask, coords, mask_updates)
-        noise_full = tf.zeros_like(image)
-        noise_full = tf.tensor_scatter_nd_update(noise_full, coords, flat_noise)
-        image = image * mask + noise_full * (1.0 - mask)
-
-    image = tf.clip_by_value(image, 0.0, 255.0)
-
-    if weight is not None:
-        return image, label, weight
     return image, label
 
 
 # ══════════════════════════════════════════════════════════════
-# MIXUP — WITHIN-CLASS FOR IRREGULARS
-# ══════════════════════════════════════════════════════════════
-
-def mixup_batch(images: tf.Tensor, labels: tf.Tensor, alpha: float = 0.4) -> tuple:
-    """Apply within-batch Mixup: mix pairs of samples using Beta distribution.
-    For within-class usage, all samples should be the same class.
-    """
-    batch_size = tf.shape(images)[0]
-    # Sample lambda from Beta(alpha, alpha)
-    lam = tf.random.uniform([], minval=0.3, maxval=0.7)  # Simplified Beta sampling
-
-    # Shuffle indices for pairing
-    indices = tf.random.shuffle(tf.range(batch_size))
-    shuffled_images = tf.gather(images, indices)
-    shuffled_labels = tf.gather(labels, indices)
-
-    mixed_images = lam * images + (1.0 - lam) * shuffled_images
-    mixed_labels = lam * labels + (1.0 - lam) * shuffled_labels
-
-    return mixed_images, mixed_labels
-
-
-# ══════════════════════════════════════════════════════════════
-# DATASET BUILDERS — BINARY (CASCADE STAGES)
+# DATASET BUILDERS
 # ══════════════════════════════════════════════════════════════
 
 def build_dataset(
@@ -1189,40 +714,22 @@ def build_dataset(
     image_size: int,
     batch_size: int,
     center_crop_ratio: float = 0.75,
-    weights: np.ndarray = None,
     augment: bool = False,
-    augment_fn=None,
     shuffle: bool = False,
     cache: bool = False,
 ) -> tf.data.Dataset:
-    """Build a tf.data.Dataset with optional augmentation and sample weighting.
-
-    Args:
-        labels: Either one-hot (N,C) for categorical or (N,) / (N,1) for binary.
-        augment_fn: Custom augmentation function. If None and augment=True, uses default.
-    """
-    if weights is not None:
-        ds = tf.data.Dataset.from_tensor_slices((image_paths, labels, weights))
-        ds = ds.map(
-            lambda p, y, w: load_and_preprocess_image(p, y, image_size, center_crop_ratio, w),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
-    else:
-        ds = tf.data.Dataset.from_tensor_slices((image_paths, labels))
-        ds = ds.map(
-            lambda p, y: load_and_preprocess_image(p, y, image_size, center_crop_ratio),
-            num_parallel_calls=tf.data.AUTOTUNE,
-        )
+    """Build a tf.data.Dataset mapping paths and 37-node target vectors."""
+    ds = tf.data.Dataset.from_tensor_slices((image_paths, labels))
+    ds = ds.map(
+        lambda p, y: load_and_preprocess_image(p, y, image_size, center_crop_ratio),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
 
     if shuffle:
         ds = ds.shuffle(buffer_size=min(len(image_paths), 10000), reshuffle_each_iteration=True)
 
     if augment:
-        aug_fn = augment_fn if augment_fn is not None else augment_image
-        if weights is not None:
-            ds = ds.map(lambda i, l, w: aug_fn(i, l, w), num_parallel_calls=tf.data.AUTOTUNE)
-        else:
-            ds = ds.map(lambda i, l: aug_fn(i, l), num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(lambda i, l: augment_image(i, l), num_parallel_calls=tf.data.AUTOTUNE)
 
     if cache:
         ds = ds.cache()
@@ -1231,198 +738,36 @@ def build_dataset(
     return ds
 
 
-def build_binary_dataset_stage1(
-    df: pd.DataFrame,
-    image_size: int,
-    batch_size: int,
-    config: Config,
-    augment: bool = False,
-    shuffle: bool = False,
-    weights: np.ndarray = None,
-) -> tf.data.Dataset:
-    """Build binary dataset for Stage 1: elliptical (1) vs non-elliptical (0).
-
-    V26 Soft Labels: When config.use_soft_labels is True, the label is the
-    raw Galaxy Zoo voting fraction Class1.1 (P(elliptical)) instead of a
-    hard 0/1 binary. This preserves human uncertainty and reduces overfitting
-    to noisy crowd-sourced boundaries.
-
-    Note: Stage 1 uses class_weight in fit() for balancing, NOT sample_weight
-    in the dataset. This avoids loss-scale instability during resolution jumps.
-    """
-    paths = df['image_path'].astype(str).to_numpy()
-
-    if config.use_soft_labels and 'Class1.1' in df.columns:
-        # Soft label: raw voting fraction P(elliptical) ∈ [0, 1]
-        soft_labels = df['Class1.1'].astype(np.float32).to_numpy()
-        soft_labels = np.clip(soft_labels, 0.0, 1.0).reshape(-1, 1)
-    else:
-        # Hard binary labels: 1 = elliptical, 0 = non-elliptical
-        soft_labels = (df['label'] == 'elliptical').astype(np.float32).to_numpy()
-
-    return build_dataset(
-        paths, soft_labels, image_size, batch_size,
-        center_crop_ratio=config.center_crop_ratio,
-        weights=weights, augment=augment, shuffle=shuffle,
-    )
-
-
-def build_binary_dataset_stage2(
-    df: pd.DataFrame,
-    image_size: int,
-    batch_size: int,
-    config: Config,
-    augment: bool = False,
-    shuffle: bool = False,
-    weights: np.ndarray = None,
-    use_irregular_augment: bool = False,
-) -> tf.data.Dataset:
-    """Build binary dataset for Stage 2: spiral (1) vs irregular (0).
-    Only include spiral and irregular samples (no ellipticals).
-
-    V26 Soft Labels: When config.use_soft_labels is True, the label is a
-    normalized spiral confidence derived from the voting fractions:
-      soft_label = Class1.2 / (Class1.2 + Class6.1 + epsilon)
-    This captures the degree of 'spiralness' vs 'oddness'.
-    """
-    # Filter to only spiral + irregular
-    mask = df['label'].isin(['spiral', 'irregular'])
-    df_filtered = df[mask].copy()
-
-    paths = df_filtered['image_path'].astype(str).to_numpy()
-
-    if config.use_soft_labels and 'Class1.2' in df_filtered.columns and 'Class6.1' in df_filtered.columns:
-        # Soft label: normalized spiral confidence
-        spiral_vote = df_filtered['Class1.2'].astype(np.float32).to_numpy()
-        odd_vote = df_filtered['Class6.1'].astype(np.float32).to_numpy()
-        soft_labels = (spiral_vote / (spiral_vote + odd_vote + 1e-7)).reshape(-1, 1)
-        soft_labels = np.clip(soft_labels, 0.0, 1.0)
-    else:
-        # Hard binary labels: 1 = spiral, 0 = irregular
-        soft_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy().reshape(-1, 1)
-
-    # Compute sample weights for the binary imbalanced problem
-    # Use hard label assignment for weight computation (soft labels shouldn't affect balancing)
-    hard_labels = (df_filtered['label'] == 'spiral').astype(np.float32).to_numpy()
-    if weights is None and config.use_sample_weighting:
-        n_spiral = (hard_labels == 1).sum()
-        n_irregular = (hard_labels == 0).sum()
-        weight_irregular = n_spiral / max(n_irregular, 1)
-        weight_spiral = 1.0
-        weights = np.where(hard_labels == 1, weight_spiral, weight_irregular).astype(np.float32)
-        # Normalize to mean=1
-        weights = weights / weights.mean()
-
-    # Use stronger augmentation for irregular-heavy pipeline
-    aug_fn = augment_image if not use_irregular_augment else None
-
-    return build_dataset(
-        paths, soft_labels, image_size, batch_size,
-        center_crop_ratio=config.center_crop_ratio,
-        weights=weights, augment=augment, augment_fn=aug_fn,
-        shuffle=shuffle,
-    )
-
-
-def filter_stage2_training_data(
-    train_df: pd.DataFrame,
-    stage1_model_path: str,
-    config: Config,
-) -> pd.DataFrame:
-    """Filter training data for Stage 2 using Stage 1 predictions.
-    Includes samples predicted as non-elliptical AND borderline ellipticals
-    (confidence < stage1_filter_confidence) to make Stage 2 robust.
-    """
-    from losses import BinaryFocalLoss
-
-    model = tf.keras.models.load_model(
-        stage1_model_path,
-        custom_objects={'BinaryFocalLoss': BinaryFocalLoss},
-    )
-
-    paths = train_df['image_path'].astype(str).to_numpy()
-    dummy_labels = np.zeros(len(paths), dtype=np.float32)
-    ds = build_dataset(
-        paths, dummy_labels, config.image_size_phase3, 32,
-        center_crop_ratio=config.center_crop_ratio,
-    )
-
-    # Get Stage 1 predictions
-    preds = model.predict(ds, verbose=0).flatten()
-
-    # Keep samples where P(elliptical) < stage1_filter_confidence
-    # This includes clear non-ellipticals + borderline cases
-    keep_mask = preds < config.stage1_filter_confidence
-    filtered_df = train_df[keep_mask].copy().reset_index(drop=True)
-
-    # Also always include ALL spiral and irregular samples (even if Stage 1 is confident)
-    spiral_irregular_mask = train_df['label'].isin(['spiral', 'irregular'])
-    must_include = train_df[spiral_irregular_mask & ~keep_mask]
-    if len(must_include) > 0:
-        filtered_df = pd.concat([filtered_df, must_include], ignore_index=True)
-
-    # Remove any ellipticals that passed through (they contaminate Stage 2)
-    # But keep some for robustness (those with low Stage 1 confidence)
-    final_mask = filtered_df['label'].isin(['spiral', 'irregular'])
-    filtered_df = filtered_df[final_mask].copy().reset_index(drop=True)
-
-    print(f'\nStage 2 Training Set (filtered from Stage 1):')
-    print(f'  Total: {len(filtered_df)}')
-    print(f'  Spiral: {(filtered_df["label"] == "spiral").sum()}')
-    print(f'  Irregular: {(filtered_df["label"] == "irregular").sum()}')
-
-    tf.keras.backend.clear_session()
-    del model
-
-    return filtered_df
-
-
 # ══════════════════════════════════════════════════════════════
 # SPLITTING & ORCHESTRATION
 # ══════════════════════════════════════════════════════════════
 
-def _split_dataframe(df: pd.DataFrame, config: Config):
+def build_datasets(labels_df: pd.DataFrame, config: Config):
+    """Split data randomly for regression."""
     train_df, temp_df = train_test_split(
-        df,
+        labels_df,
         test_size=config.val_split + config.test_split,
         random_state=config.seed,
-        stratify=df['label_id'],
     )
     test_ratio_of_temp = config.test_split / (config.val_split + config.test_split)
     val_df, test_df = train_test_split(
         temp_df,
         test_size=test_ratio_of_temp,
         random_state=config.seed,
-        stratify=temp_df['label_id'],
     )
-    return train_df.reset_index(drop=True), val_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
-
-def build_datasets(labels_df: pd.DataFrame, config: Config):
-    """Split data and return train/val/test DataFrames + class counts.
-    Note: Actual tf.data.Dataset construction is deferred to training functions
-    to support per-phase resolution curriculum.
-    """
-    train_df, val_df, test_df = _split_dataframe(labels_df, config)
-
-    class_counts = labels_df['label'].value_counts().reindex(CLASS_NAMES, fill_value=0).to_dict()
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
 
     split_info = {
         'train_size': len(train_df),
         'val_size': len(val_df),
         'test_size': len(test_df),
         'total_labeled_images': len(labels_df),
-        'class_distribution': class_counts,
-        'config_snapshot': {
-            'irregular_threshold': config.irregular_threshold,
-            'irregular_margin': config.irregular_margin,
-            'spiral_disk_threshold': config.spiral_disk_threshold,
-            'spiral_arms_threshold': config.spiral_arms_threshold,
-            'elliptical_threshold': config.elliptical_threshold,
-        },
     }
 
-    return class_counts, split_info, (train_df, val_df, test_df)
+    return split_info, (train_df, val_df, test_df)
 
 
 # ============================================================
@@ -1618,786 +963,104 @@ def load_stacker(model_path: Path):
 
 
 
+from tqdm import tqdm
 
 
 
-# ══════════════════════════════════════════════════════════════
-# TTA — 16 STRUCTURED AUGMENTS
-# ══════════════════════════════════════════════════════════════
-
-def _build_tta_dataset(paths: np.ndarray, image_size: int, center_crop_ratio: float,
-                        rotation_k: int, flip_lr: bool, crop_ratio: float) -> tf.data.Dataset:
-    """Build a single TTA view dataset with specific augmentation."""
-    ds = tf.data.Dataset.from_tensor_slices(paths)
-
-    def load_and_augment(path):
-        img = tf.io.read_file(path)
-        img = tf.image.decode_jpeg(img, channels=3)
-        img = tf.cast(img, tf.float32)
-
-        # Center crop with specified ratio
-        h = tf.shape(img)[0]
-        w = tf.shape(img)[1]
-        ch = tf.cast(tf.cast(h, tf.float32) * crop_ratio, tf.int32)
-        cw = tf.cast(tf.cast(w, tf.float32) * crop_ratio, tf.int32)
-        offset_h = (h - ch) // 2
-        offset_w = (w - cw) // 2
-        img = tf.image.crop_to_bounding_box(img, offset_h, offset_w, ch, cw)
-
-        # Rotation (0, 90, 180, 270)
-        img = tf.image.rot90(img, k=rotation_k)
-
-        # Flip
-        if flip_lr:
-            img = tf.image.flip_left_right(img)
-
-        img = tf.image.resize(img, [image_size, image_size])
-        img = tf.clip_by_value(img, 0.0, 255.0)
-        return img
-
-    ds = ds.map(load_and_augment, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.batch(32).prefetch(tf.data.AUTOTUNE)
-    return ds
+def calculate_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Calculate the global Root Mean Squared Error over all targets."""
+    mse = np.mean(np.square(y_true - y_pred))
+    return np.sqrt(mse)
 
 
-def run_tta_predictions_binary(
-    model: tf.keras.Model,
-    paths: np.ndarray,
-    image_size: int,
-    center_crop_ratio: float = 0.75,
-    n_augments: int = 16,
-) -> np.ndarray:
-    """Run TTA with 16 structured augments for binary models.
+def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -> np.ndarray:
+    """Run Test-Time Augmentation (TTA) and return averaged predictions."""
+    print(f"\n[Evaluation] Running TTA ({config.tta_n_augments} passes)...")
 
-    16 combinations: 4 rotations × 2 flips × 2 center crops (0.75, 0.85)
-    Returns averaged sigmoid probabilities.
-    """
-    probs_sum = np.zeros(len(paths), dtype=np.float64)
-    count = 0
+    # Dummy labels for the dataset builder
+    dummy_labels = np.zeros((len(test_paths), 37), dtype=np.float32)
 
-    crop_ratios = [0.75, 0.85]
-    rotations = [0, 1, 2, 3]
-    flips = [False, True]
+    tta_preds = []
 
-    for crop_r in crop_ratios:
-        for rot_k in rotations:
-            for flip_lr in flips:
-                if count >= n_augments:
-                    break
-                ds = _build_tta_dataset(paths, image_size, center_crop_ratio, rot_k, flip_lr, crop_r)
-                preds = model.predict(ds, verbose=0).flatten()
-                probs_sum += preds
-                count += 1
-            if count >= n_augments:
-                break
-        if count >= n_augments:
-            break
+    # Pass 1: Original (unaugmented) center crop
+    ds_base = build_dataset(
+        test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
+    )
+    base_preds = model.predict(ds_base, verbose=1)
+    tta_preds.append(base_preds)
 
-    return probs_sum / float(count)
-
-
-# ══════════════════════════════════════════════════════════════
-# CASCADE INFERENCE
-# ══════════════════════════════════════════════════════════════
-
-def cascade_predict(
-    stage1_model: tf.keras.Model,
-    stage2_models: list[tf.keras.Model],
-    paths: np.ndarray,
-    config: Config,
-    stage1_threshold: float = 0.5,
-    stage2_threshold: float = 0.5,
-    use_tta: bool = True,
-) -> tuple[np.ndarray, dict]:
-    """Run full cascade inference pipeline.
-
-    Stage 1: P(elliptical) >= stage1_threshold → predict elliptical
-    Stage 2: Average ensemble → P(spiral) >= stage2_threshold → spiral, else irregular
-
-    Returns:
-        predictions: int array of class IDs (0=spiral, 1=elliptical, 2=irregular)
-        details: dict with per-stage probabilities for analysis
-    """
-    image_size = config.image_size_phase3
-    n_samples = len(paths)
-
-    # Stage 1 predictions
-    if use_tta:
-        stage1_probs = run_tta_predictions_binary(
-            stage1_model, paths, image_size,
-            center_crop_ratio=config.center_crop_ratio,
-            n_augments=config.tta_n_augments,
+    # Passes 2 to N: Augmented crops/rotations
+    for i in range(config.tta_n_augments - 1):
+        ds_aug = build_dataset(
+            test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
+            center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=False,
         )
-    else:
-        dummy_labels = np.zeros(n_samples, dtype=np.float32)
-        ds = build_dataset(paths, dummy_labels, image_size, 32, center_crop_ratio=config.center_crop_ratio)
-        stage1_probs = stage1_model.predict(ds, verbose=0).flatten()
+        preds = model.predict(ds_aug, verbose=0)
+        tta_preds.append(preds)
+        print(f"  TTA pass {i+2}/{config.tta_n_augments} completed.")
 
-    # Classify Stage 1
-    is_elliptical = stage1_probs >= stage1_threshold
-    non_elliptical_indices = np.where(~is_elliptical)[0]
+    return np.mean(tta_preds, axis=0)
 
-    # Stage 2 predictions (only for non-elliptical samples)
-    stage2_probs_avg = np.zeros(n_samples, dtype=np.float64)
-    if len(non_elliptical_indices) > 0:
-        ne_paths = paths[non_elliptical_indices]
 
-        for s2_model in stage2_models:
-            if use_tta:
-                s2_probs = run_tta_predictions_binary(
-                    s2_model, ne_paths, image_size,
-                    center_crop_ratio=config.center_crop_ratio,
-                    n_augments=config.tta_n_augments,
-                )
-            else:
-                dummy_labels = np.zeros(len(ne_paths), dtype=np.float32)
-                ds = build_dataset(ne_paths, dummy_labels, image_size, 32,
-                                   center_crop_ratio=config.center_crop_ratio)
-                s2_probs = s2_model.predict(ds, verbose=0).flatten()
+def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list[str]):
+    """Evaluate the single unified regression model using RMSE."""
+    output_dir = config.output_dir
+    model_path = output_dir / 'unified_best.keras'
 
-            stage2_probs_avg[non_elliptical_indices] += s2_probs
+    if not model_path.exists():
+        print(f"Error: Unified model not found at {model_path}")
+        return
 
-        stage2_probs_avg[non_elliptical_indices] /= len(stage2_models)
+    print('\n' + '=' * 60)
+    print('EVALUATION: REGRESSION RMSE')
+    print('=' * 60)
 
-    # Final classification
-    predictions = np.full(n_samples, -1, dtype=np.int32)
-    predictions[is_elliptical] = 1  # elliptical
-
-    # Among non-elliptical:
-    is_spiral = stage2_probs_avg >= stage2_threshold
-    for idx in non_elliptical_indices:
-        if is_spiral[idx]:
-            predictions[idx] = 0  # spiral
-        else:
-            predictions[idx] = 2  # irregular
-
-    details = {
-        'stage1_probs': stage1_probs,
-        'stage2_probs': stage2_probs_avg,
-        'n_elliptical_predicted': int(is_elliptical.sum()),
-        'n_non_elliptical': len(non_elliptical_indices),
-    }
-
-    return predictions, details
-
-
-# ══════════════════════════════════════════════════════════════
-# THRESHOLD CALIBRATION — 2D GRID SEARCH
-# ══════════════════════════════════════════════════════════════
-
-def calibrate_cascade_thresholds(
-    stage1_model: tf.keras.Model,
-    stage2_models: list[tf.keras.Model],
-    val_df: pd.DataFrame,
-    config: Config,
-) -> tuple[float, float]:
-    """Calibrate both cascade thresholds using 2D grid search on validation set.
-
-    Optimizes for macro-F1 score across all 3 classes.
-    """
-    paths = val_df['image_path'].astype(str).to_numpy()
-    y_true = val_df['label_id'].to_numpy()
-    image_size = config.image_size_phase3
-
-    # Get raw probabilities (without TTA for speed during calibration)
-    dummy_labels = np.zeros(len(paths), dtype=np.float32)
-    ds = build_dataset(paths, dummy_labels, image_size, 32, center_crop_ratio=config.center_crop_ratio)
-    stage1_probs = stage1_model.predict(ds, verbose=0).flatten()
-
-    # For Stage 2, predict all non-elliptical candidates
-    stage2_probs_all = np.zeros(len(paths), dtype=np.float64)
-    for s2_model in stage2_models:
-        ds = build_dataset(paths, dummy_labels, image_size, 32, center_crop_ratio=config.center_crop_ratio)
-        s2_preds = s2_model.predict(ds, verbose=0).flatten()
-        stage2_probs_all += s2_preds
-    stage2_probs_all /= len(stage2_models)
-
-    best_macro_f1 = -1.0
-    best_t1, best_t2 = 0.5, 0.5
-
-    t1_range = np.linspace(0.3, 0.7, 41)
-    t2_range = np.linspace(0.3, 0.7, 41)
-
-    print('\n[Threshold Calibration] 2D grid search...')
-
-    for t1 in t1_range:
-        for t2 in t2_range:
-            preds = np.full(len(paths), -1, dtype=np.int32)
-            is_ell = stage1_probs >= t1
-            preds[is_ell] = 1  # elliptical
-            ne_mask = ~is_ell
-            ne_spiral = stage2_probs_all >= t2
-            preds[ne_mask & ne_spiral] = 0  # spiral
-            preds[ne_mask & ~ne_spiral] = 2  # irregular
-
-            if np.any(preds == -1):
-                continue
-
-            macro_f1 = f1_score(y_true, preds, average='macro', zero_division=0)
-            if macro_f1 > best_macro_f1:
-                best_macro_f1 = macro_f1
-                best_t1 = float(t1)
-                best_t2 = float(t2)
-
-    print(f'  Best thresholds: stage1={best_t1:.3f}, stage2={best_t2:.3f}')
-    print(f'  Best macro-F1:   {best_macro_f1:.4f}')
-
-    return best_t1, best_t2
-
-
-# ══════════════════════════════════════════════════════════════
-# EXPECTED CALIBRATION ERROR (ECE)
-# ══════════════════════════════════════════════════════════════
-
-def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
-    """Compute Expected Calibration Error for binary predictions.
-
-    |mean_confidence - mean_accuracy| per bin, weighted by bin count.
-    """
-    bin_boundaries = np.linspace(0, 1, n_bins + 1)
-    ece = 0.0
-    total = len(y_true)
-
-    for i in range(n_bins):
-        mask = (y_prob >= bin_boundaries[i]) & (y_prob < bin_boundaries[i + 1])
-        if mask.sum() == 0:
-            continue
-        bin_acc = y_true[mask].mean()
-        bin_conf = y_prob[mask].mean()
-        ece += mask.sum() / total * abs(bin_acc - bin_conf)
-
-    return float(ece)
-
-
-# ══════════════════════════════════════════════════════════════
-# CASCADE ERROR ANALYSIS
-# ══════════════════════════════════════════════════════════════
-
-def cascade_error_analysis(
-    y_true: np.ndarray,
-    predictions: np.ndarray,
-    details: dict,
-    stage1_threshold: float,
-) -> dict:
-    """Decompose errors by cascade stage.
-
-    Reports:
-    - Stage 1 errors: ellipticals missed + non-ellipticals blocked
-    - Stage 2 errors: spiral↔irregular misclassifications
-    - Percentage of total errors from each stage
-    """
-    total_errors = int(np.sum(y_true != predictions))
-    if total_errors == 0:
-        return {'total_errors': 0, 'stage1_error_pct': 0.0, 'stage2_error_pct': 0.0}
-
-    stage1_probs = details['stage1_probs']
-    is_ell_pred = stage1_probs >= stage1_threshold
-    is_ell_true = y_true == 1  # elliptical = 1
-
-    # Stage 1 errors
-    ell_missed = int(np.sum(is_ell_true & ~is_ell_pred))         # FN (missed ellipticals)
-    non_ell_blocked = int(np.sum(~is_ell_true & is_ell_pred))     # FP (non-ell called ell)
-    stage1_errors = ell_missed + non_ell_blocked
-
-    # Stage 2 errors (among non-elliptical predictions)
-    ne_mask = ~is_ell_pred
-    ne_true = y_true[ne_mask]
-    ne_pred = predictions[ne_mask]
-    stage2_errors = int(np.sum(ne_true != ne_pred)) - ell_missed  # Subtract Stage 1 leaks
-    stage2_errors = max(0, stage2_errors)
-
-    # Specific Stage 2 confusions
-    spiral_as_irregular = int(np.sum((ne_true == 0) & (ne_pred == 2)))
-    irregular_as_spiral = int(np.sum((ne_true == 2) & (ne_pred == 0)))
-
-    stage1_pct = stage1_errors / max(total_errors, 1) * 100
-    stage2_pct = stage2_errors / max(total_errors, 1) * 100
-
-    return {
-        'total_errors': total_errors,
-        'stage1_errors': stage1_errors,
-        'stage1_elliptical_missed': ell_missed,
-        'stage1_nonelliptical_blocked': non_ell_blocked,
-        'stage1_false_negative_rate': float(ell_missed / max(is_ell_true.sum(), 1)),
-        'stage2_errors': stage2_errors,
-        'stage2_spiral_as_irregular': spiral_as_irregular,
-        'stage2_irregular_as_spiral': irregular_as_spiral,
-        'stage1_error_pct': float(stage1_pct),
-        'stage2_error_pct': float(stage2_pct),
-    }
-
-
-# ══════════════════════════════════════════════════════════════
-# PLOTTING FUNCTIONS
-# ══════════════════════════════════════════════════════════════
-
-def plot_training_curves(history: dict, out_path: Path, title: str) -> None:
-    """Plot loss and accuracy curves for a training phase."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    axes[0].plot(history.get('loss', []), label='train_loss', linewidth=2)
-    axes[0].plot(history.get('val_loss', []), label='val_loss', linewidth=2)
-    axes[0].set_title(f'{title} — Loss', fontsize=14)
-    axes[0].set_xlabel('Epoch')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    acc_key = 'binary_accuracy' if 'binary_accuracy' in history else 'accuracy'
-    val_acc_key = f'val_{acc_key}'
-    axes[1].plot(history.get(acc_key, []), label='train_acc', linewidth=2)
-    axes[1].plot(history.get(val_acc_key, []), label='val_acc', linewidth=2)
-    axes[1].set_title(f'{title} — Accuracy', fontsize=14)
-    axes[1].set_xlabel('Epoch')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_confusion_matrix(y_true, y_pred, class_names, out_path, title='Confusion Matrix',
-                          normalize=False):
-    """Plot confusion matrix with optional normalization."""
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
-    if normalize:
-        cm = cm.astype('float') / cm.sum(axis=1, keepdims=True)
-        fmt = '.2%'
-    else:
-        fmt = 'd'
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
-    ax.figure.colorbar(im, ax=ax)
-
-    ax.set(
-        xticks=np.arange(len(class_names)),
-        yticks=np.arange(len(class_names)),
-        xticklabels=class_names,
-        yticklabels=class_names,
-        title=title,
-        ylabel='True Label',
-        xlabel='Predicted Label',
-    )
-    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-
-    # Text annotations
-    thresh = cm.max() / 2.0
-    for i in range(len(class_names)):
-        for j in range(len(class_names)):
-            val = f'{cm[i, j]:{fmt}}' if not normalize else f'{cm[i, j]:.2%}'
-            ax.text(j, i, val, ha='center', va='center',
-                    color='white' if cm[i, j] > thresh else 'black', fontsize=12)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_roc_curves(y_true_onehot, y_probs_3class, class_names, out_path):
-    """Plot one-vs-rest ROC curves for all classes."""
-    fig, ax = plt.subplots(figsize=(8, 6))
-    colors = ['#2196F3', '#4CAF50', '#FF5722']
-
-    for i, (cls, color) in enumerate(zip(class_names, colors)):
-        if y_true_onehot.shape[1] > i:
-            fpr, tpr, _ = roc_curve(y_true_onehot[:, i], y_probs_3class[:, i])
-            auc = roc_auc_score(y_true_onehot[:, i], y_probs_3class[:, i])
-            ax.plot(fpr, tpr, color=color, linewidth=2, label=f'{cls} (AUC={auc:.3f})')
-
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_xlabel('False Positive Rate', fontsize=12)
-    ax.set_ylabel('True Positive Rate', fontsize=12)
-    ax.set_title('ROC Curves (One-vs-Rest)', fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_threshold_sensitivity(
-    y_true: np.ndarray,
-    stage1_probs: np.ndarray,
-    stage2_probs: np.ndarray,
-    output_dir: Path,
-):
-    """Plot threshold sensitivity curves for both stages."""
-    # Stage 1
-    fig, ax = plt.subplots(figsize=(8, 5))
-    thresholds = np.linspace(0.1, 0.9, 81)
-    f1s = []
-    for t in thresholds:
-        preds = np.where(stage1_probs >= t, 1, 0)
-        is_ell = y_true == 1
-        f1 = f1_score(is_ell.astype(int), preds, zero_division=0)
-        f1s.append(f1)
-
-    ax.plot(thresholds, f1s, linewidth=2, color='#2196F3')
-    best_idx = np.argmax(f1s)
-    ax.axvline(thresholds[best_idx], color='red', linestyle='--', alpha=0.7,
-               label=f'Best: {thresholds[best_idx]:.2f} (F1={f1s[best_idx]:.3f})')
-    ax.set_xlabel('Threshold', fontsize=12)
-    ax.set_ylabel('Elliptical F1', fontsize=12)
-    ax.set_title('Stage 1 Threshold Sensitivity', fontsize=14)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_dir / 'threshold_sensitivity_stage1.png', dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-    # Stage 2
-    fig, ax = plt.subplots(figsize=(8, 5))
-    f1s = []
-    non_ell_mask = y_true != 1
-    y_true_s2 = y_true[non_ell_mask]
-    s2_probs_ne = stage2_probs[non_ell_mask]
-
-    for t in thresholds:
-        preds = np.where(s2_probs_ne >= t, 0, 2)  # spiral=0 if >= t, else irregular=2
-        # Compute irregular F1
-        is_irr_true = (y_true_s2 == 2).astype(int)
-        is_irr_pred = (preds == 2).astype(int)
-        f1 = f1_score(is_irr_true, is_irr_pred, zero_division=0)
-        f1s.append(f1)
-
-    ax.plot(thresholds, f1s, linewidth=2, color='#FF5722')
-    best_idx = np.argmax(f1s)
-    ax.axvline(thresholds[best_idx], color='red', linestyle='--', alpha=0.7,
-               label=f'Best: {thresholds[best_idx]:.2f} (F1={f1s[best_idx]:.3f})')
-    ax.set_xlabel('Threshold', fontsize=12)
-    ax.set_ylabel('Irregular F1', fontsize=12)
-    ax.set_title('Stage 2 Threshold Sensitivity', fontsize=14)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_dir / 'threshold_sensitivity_stage2.png', dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_confidence_calibration(y_true, y_probs_3class, class_names, out_path, n_bins=10):
-    """Plot Expected Calibration Error diagram per class."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    colors = ['#2196F3', '#4CAF50', '#FF5722']
-
-    for i, (cls, color, ax) in enumerate(zip(class_names, colors, axes)):
-        y_binary = (y_true == i).astype(int)
-        probs = y_probs_3class[:, i]
-
-        bin_boundaries = np.linspace(0, 1, n_bins + 1)
-        bin_accs = []
-        bin_confs = []
-        bin_counts = []
-
-        for b in range(n_bins):
-            mask = (probs >= bin_boundaries[b]) & (probs < bin_boundaries[b + 1])
-            if mask.sum() > 0:
-                bin_accs.append(y_binary[mask].mean())
-                bin_confs.append(probs[mask].mean())
-                bin_counts.append(mask.sum())
-            else:
-                bin_accs.append(0)
-                bin_confs.append((bin_boundaries[b] + bin_boundaries[b + 1]) / 2)
-                bin_counts.append(0)
-
-        ece = compute_ece(y_binary, probs, n_bins)
-
-        bin_centers = [(bin_boundaries[b] + bin_boundaries[b + 1]) / 2 for b in range(n_bins)]
-        ax.bar(bin_centers, bin_accs, width=1.0 / n_bins, alpha=0.6, color=color, edgecolor='white')
-        ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
-        ax.set_title(f'{cls} (ECE={ece:.4f})', fontsize=12)
-        ax.set_xlabel('Confidence')
-        ax.set_ylabel('Accuracy')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.grid(True, alpha=0.3)
-
-    fig.suptitle('Confidence Calibration (ECE)', fontsize=14)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_class_metrics_bar(report: dict, class_names: list, out_path: Path):
-    """Plot P/R/F1 bar chart per class."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    x = np.arange(len(class_names))
-    width = 0.25
-
-    precisions = [report.get(c, {}).get('precision', 0) for c in class_names]
-    recalls = [report.get(c, {}).get('recall', 0) for c in class_names]
-    f1s = [report.get(c, {}).get('f1-score', 0) for c in class_names]
-
-    bars1 = ax.bar(x - width, precisions, width, label='Precision', color='#2196F3', alpha=0.8)
-    bars2 = ax.bar(x, recalls, width, label='Recall', color='#4CAF50', alpha=0.8)
-    bars3 = ax.bar(x + width, f1s, width, label='F1-Score', color='#FF5722', alpha=0.8)
-
-    # Value labels
-    for bars in [bars1, bars2, bars3]:
-        for bar in bars:
-            height = bar.get_height()
-            ax.annotate(f'{height:.2f}', xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3), textcoords='offset points', ha='center', fontsize=9)
-
-    ax.set_ylabel('Score', fontsize=12)
-    ax.set_title('Per-Class Metrics', fontsize=14)
-    ax.set_xticks(x)
-    ax.set_xticklabels(class_names, fontsize=11)
-    ax.legend(fontsize=11)
-    ax.set_ylim(0, 1.15)
-    ax.grid(True, alpha=0.3, axis='y')
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-def plot_confidence_histogram(predictions: np.ndarray, details: dict,
-                               class_names: list, out_path: Path):
-    """Plot prediction confidence distribution histogram."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Stage 1 confidence
-    axes[0].hist(details['stage1_probs'], bins=50, alpha=0.7, color='#2196F3', edgecolor='white')
-    axes[0].set_title('Stage 1 Confidence: P(Elliptical)', fontsize=12)
-    axes[0].set_xlabel('Probability')
-    axes[0].set_ylabel('Count')
-    axes[0].grid(True, alpha=0.3)
-
-    # Stage 2 confidence (non-elliptical only)
-    ne_probs = details['stage2_probs'][details['stage2_probs'] > 0]
-    if len(ne_probs) > 0:
-        axes[1].hist(ne_probs, bins=50, alpha=0.7, color='#FF5722', edgecolor='white')
-    axes[1].set_title('Stage 2 Confidence: P(Spiral)', fontsize=12)
-    axes[1].set_xlabel('Probability')
-    axes[1].set_ylabel('Count')
-    axes[1].grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches='tight')
-    plt.close(fig)
-
-
-# ══════════════════════════════════════════════════════════════
-# MAIN EVALUATION FUNCTION
-# ══════════════════════════════════════════════════════════════
-
-def evaluate_cascade(
-    stage1_model_path: str,
-    stage2_model_paths: list[str],
-    test_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    config: Config,
-    output_dir: Path,
-) -> dict:
-    """Comprehensive cascade pipeline evaluation.
-
-    1. Load models
-    2. Calibrate thresholds on validation set
-    3. Run standard + TTA predictions on test set
-    4. Compute all metrics
-    5. Generate all plots
-    """
-    print('\n[Evaluation] Loading models...')
-    from losses import (
-        OHEMBinaryLoss,
-        CategoricalFocalLoss,
-        SoftBinaryAccuracy,
-        SoftAUC,
-        SoftPrecision,
-        SoftRecall
-    )
+    # Load model
+    print("Loading unified model...")
     custom_objects = {
-        'BinaryFocalLoss': BinaryFocalLoss,
-        'OHEMBinaryLoss': OHEMBinaryLoss,
-        'CategoricalFocalLoss': CategoricalFocalLoss,
-        'FocalLoss': CategoricalFocalLoss,
-        'SoftBinaryAccuracy': SoftBinaryAccuracy,
-        'SoftAUC': SoftAUC,
-        'SoftPrecision': SoftPrecision,
-        'SoftRecall': SoftRecall,
+        'RMSELoss': RMSELoss,
+        'rmse_metric': rmse_metric,
     }
+    model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
 
-    stage1_model = tf.keras.models.load_model(stage1_model_path, custom_objects=custom_objects)
-    stage2_models = [
-        tf.keras.models.load_model(p, custom_objects=custom_objects)
-        for p in stage2_model_paths
-    ]
+    test_paths = test_df['image_path'].values
+    y_true = test_df[target_cols].values.astype(np.float32)
 
-    print(f'  Stage 1: {stage1_model_path}')
-    for p in stage2_model_paths:
-        print(f'  Stage 2: {p}')
-
-    # ── Calibrate thresholds ──
-    t1, t2 = calibrate_cascade_thresholds(stage1_model, stage2_models, val_df, config)
-
-    # ── Test set evaluation ──
-    test_paths = test_df['image_path'].astype(str).to_numpy()
-    y_true = test_df['label_id'].to_numpy()
-    y_true_onehot = np.eye(3)[y_true]
-
-    # Standard predictions
-    print('\n[Evaluation] Standard predictions...')
-    preds_standard, details_standard = cascade_predict(
-        stage1_model, stage2_models, test_paths, config,
-        stage1_threshold=t1, stage2_threshold=t2, use_tta=False,
+    # Standard Prediction (No TTA)
+    dummy_labels = np.zeros_like(y_true)
+    ds_test = build_dataset(
+        test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
     )
-    acc_standard = float(np.mean(preds_standard == y_true))
 
-    # TTA predictions
-    print('[Evaluation] TTA-16 predictions...')
-    preds_tta, details_tta = cascade_predict(
-        stage1_model, stage2_models, test_paths, config,
-        stage1_threshold=t1, stage2_threshold=t2, use_tta=True,
-    )
-    acc_tta = float(np.mean(preds_tta == y_true))
+    print("\nRunning standard evaluation (1-pass)...")
+    y_pred_std = model.predict(ds_test, verbose=1)
+    rmse_std = calculate_rmse(y_true, y_pred_std)
 
-    # ── Metrics ──
-    report = classification_report(y_true, preds_tta, target_names=CLASS_NAMES, output_dict=True)
-    kappa = cohen_kappa_score(y_true, preds_tta)
-    mcc = matthews_corrcoef(y_true, preds_tta)
+    # TTA Prediction
+    y_pred_tta = predict_tta(model, test_paths, config)
+    rmse_tta = calculate_rmse(y_true, y_pred_tta)
 
-    # Brier scores (construct 3-class probabilities from cascade)
-    probs_3class = np.zeros((len(test_paths), 3), dtype=np.float64)
-    probs_3class[:, 1] = details_tta['stage1_probs']  # P(elliptical)
-    probs_3class[:, 0] = (1 - details_tta['stage1_probs']) * details_tta['stage2_probs']  # P(spiral)
-    probs_3class[:, 2] = (1 - details_tta['stage1_probs']) * (1 - details_tta['stage2_probs'])  # P(irregular)
-    # Normalize
-    row_sums = probs_3class.sum(axis=1, keepdims=True)
-    probs_3class = probs_3class / np.maximum(row_sums, 1e-8)
+    # Report
+    print('\n' + '-' * 40)
+    print("TEST METRICS (Kaggle Leaderboard Objective)")
+    print('-' * 40)
+    print(f"  RMSE (Single Pass): {rmse_std:.5f}")
+    print(f"  RMSE (TTA {config.tta_n_augments}x):     {rmse_tta:.5f}")
+    print('-' * 40)
 
-    brier = {
-        CLASS_NAMES[i]: float(brier_score_loss(y_true_onehot[:, i], probs_3class[:, i]))
-        for i in range(3)
+    # Save results
+    results = {
+        'test_size': len(test_df),
+        'rmse_standard': float(rmse_std),
+        'rmse_tta': float(rmse_tta),
     }
 
-    # ECE per class
-    ece_scores = {}
-    for i, cls in enumerate(CLASS_NAMES):
-        y_binary = (y_true == i).astype(int)
-        ece_scores[cls] = compute_ece(y_binary, probs_3class[:, i])
+    with open(output_dir / 'evaluation_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
 
-    # Error analysis
-    error_analysis = cascade_error_analysis(y_true, preds_tta, details_tta, t1)
-
-    # Acceptance criteria
-    min_targets = {
-        'overall_accuracy_95': acc_tta >= 0.95,
-        'irregular_f1_80': report.get('irregular', {}).get('f1-score', 0) >= 0.80,
-        'irregular_recall_80': report.get('irregular', {}).get('recall', 0) >= 0.80,
-        'spiral_f1_90': report.get('spiral', {}).get('f1-score', 0) >= 0.90,
-        'elliptical_f1_93': report.get('elliptical', {}).get('f1-score', 0) >= 0.93,
-        'cohen_kappa_90': kappa >= 0.90,
-        'stage1_fnr_03': error_analysis.get('stage1_false_negative_rate', 1.0) <= 0.03,
-    }
-
-    # ── Generate all plots ──
-    print('\n[Evaluation] Generating plots...')
-
-    # Training curves (from saved histories)
-    for stage_prefix in ['stage1']:
-        hist_path = output_dir / f'{stage_prefix}_history.json'
-        if hist_path.exists():
-            with open(hist_path) as f:
-                hist = json.load(f)
-            for phase_key, phase_hist in hist.items():
-                plot_training_curves(
-                    phase_hist,
-                    output_dir / f'training_curves_{stage_prefix}_{phase_key}.png',
-                    f'{stage_prefix.upper()} {phase_key}',
-                )
-
-    # Stage 2 training curves
-    for arch, seed in zip(config.stage2_architectures, config.stage2_seeds):
-        tag = f'stage2_{arch}_seed{seed}'
-        hist_path = output_dir / f'{tag}_history.json'
-        if hist_path.exists():
-            with open(hist_path) as f:
-                hist = json.load(f)
-            for phase_key, phase_hist in hist.items():
-                plot_training_curves(
-                    phase_hist,
-                    output_dir / f'training_curves_{tag}_{phase_key}.png',
-                    f'{tag} {phase_key}',
-                )
-
-    # Confusion matrices
-    plot_confusion_matrix(y_true, preds_tta, CLASS_NAMES,
-                          output_dir / 'confusion_matrix_cascade.png',
-                          'Cascade Confusion Matrix')
-    plot_confusion_matrix(y_true, preds_tta, CLASS_NAMES,
-                          output_dir / 'confusion_matrix_normalized.png',
-                          'Cascade Confusion Matrix (Normalized)', normalize=True)
-
-    # Stage 2 binary confusion (spiral vs irregular only)
-    ne_mask = y_true != 1
-    if ne_mask.sum() > 0:
-        s2_true = y_true[ne_mask]
-        s2_pred = preds_tta[ne_mask]
-        s2_names = ['spiral', 'irregular']
-        # Remap: spiral=0, irregular=2 → binary 0, 1
-        s2_true_binary = np.where(s2_true == 0, 0, 1)
-        s2_pred_binary = np.where(s2_pred == 0, 0, 1)
-        plot_confusion_matrix(s2_true_binary, s2_pred_binary, s2_names,
-                              output_dir / 'confusion_matrix_stage2_binary.png',
-                              'Stage 2 Binary: Spiral vs Irregular')
-
-    # ROC curves
-    try:
-        plot_roc_curves(y_true_onehot, probs_3class, CLASS_NAMES,
-                        output_dir / 'roc_curves_cascade.png')
-    except Exception as e:
-        print(f'  Warning: ROC plot failed: {e}')
-
-    # Threshold sensitivity
-    plot_threshold_sensitivity(y_true, details_tta['stage1_probs'],
-                               details_tta['stage2_probs'], output_dir)
-
-    # Confidence calibration
-    plot_confidence_calibration(y_true, probs_3class, CLASS_NAMES,
-                                output_dir / 'confidence_calibration.png')
-
-    # Class metrics bar
-    plot_class_metrics_bar(report, CLASS_NAMES, output_dir / 'class_metrics_bar.png')
-
-    # Confidence histogram
-    plot_confidence_histogram(preds_tta, details_tta, CLASS_NAMES,
-                              output_dir / 'prediction_confidence_histogram.png')
-
-    # ── Compile results ──
-    cascade_eval = {
-        'test_accuracy_standard': acc_standard,
-        'test_accuracy_tta': acc_tta,
-        'calibrated_thresholds': {'stage1': t1, 'stage2': t2},
-        'cohen_kappa': float(kappa),
-        'matthews_corrcoef': float(mcc),
-        'classification_report': report,
-        'brier_scores': brier,
-        'ece_scores': ece_scores,
-        'error_analysis': error_analysis,
-        'min_targets_met': min_targets,
-    }
-
-    # Print summary
-    print('\n=== Cascade Evaluation Summary ===')
-    print(f'  Standard Accuracy: {acc_standard:.4f}')
-    print(f'  TTA-16 Accuracy:   {acc_tta:.4f}')
-    print(f"  Cohen's Kappa:     {kappa:.4f}")
-    print(f'  Matthews MCC:      {mcc:.4f}')
-    print(f'  Thresholds: t1={t1:.3f}, t2={t2:.3f}')
-    print(f'\n  Error decomposition:')
-    print(f"    Stage 1: {error_analysis.get('stage1_error_pct', 0):.1f}% of errors")
-    print(f"    Stage 2: {error_analysis.get('stage2_error_pct', 0):.1f}% of errors")
-    print(f"    Stage 1 FNR: {error_analysis.get('stage1_false_negative_rate', 0):.4f}")
-
-    # Cleanup
-    del stage1_model
-    for m in stage2_models:
-        del m
-    tf.keras.backend.clear_session()
-
-    return {'cascade_evaluation': cascade_eval}
+    print(f"\nEvaluation complete. Results saved to {output_dir / 'evaluation_results.json'}")
 
 
 # ============================================================
@@ -2414,107 +1077,73 @@ if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
 
 class ConciseLogging(tf.keras.callbacks.Callback):
     """Minimal epoch-end logging to keep Kaggle notebook output clean."""
-
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        # Support both 'accuracy' and 'binary_accuracy' metric names
-        acc_key = 'accuracy' if 'accuracy' in logs else 'binary_accuracy'
-        val_acc_key = 'val_accuracy' if 'val_accuracy' in logs else 'val_binary_accuracy'
         msg = (
             f"Epoch {epoch + 1:03d} | "
             f"loss: {logs.get('loss', 0):.4f} | "
-            f"acc: {logs.get(acc_key, 0):.4f} | "
-            f"val_acc: {logs.get(val_acc_key, 0):.4f}"
+            f"rmse: {logs.get('rmse_metric', 0):.4f} | "
+            f"val_loss: {logs.get('val_loss', 0):.4f} | "
+            f"val_rmse: {logs.get('val_rmse_metric', 0):.4f}"
         )
         print(msg)
 
 
-def _binary_metrics():
-    """Standard metrics for binary classification stages (Soft Label aware)."""
-    return [
-        SoftBinaryAccuracy(name='binary_accuracy'),
-        SoftAUC(name='auc'),
-        SoftPrecision(name='precision'),
-        SoftRecall(name='recall'),
-    ]
-
-
-# ══════════════════════════════════════════════════════════════
-# STAGE 1 — ELLIPTICAL BINARY CLASSIFIER
-# ══════════════════════════════════════════════════════════════
-
-def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_str):
-    """Train Stage 1 (elliptical vs non-elliptical) in an isolated subprocess.
-
-    3-phase progressive resizing curriculum:
-      Phase 1: 128px warmup (frozen backbone)
-      Phase 2: 192px mid-tune (unfreeze last 50 layers)
-      Phase 3: 224px full fine-tune (unfreeze last 80 layers) + SGDR
-    """
-    import gc
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-    config = Config(**config_dict)
-    output_dir = Path(output_dir_str)
-    train_df = pd.DataFrame(train_df_dict)
-    val_df = pd.DataFrame(val_df_dict)
+def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Path):
+    """Train single 37-node regression model using progressive resizing."""
 
     set_global_seed(config.seed)
     if config.enable_mixed_precision:
         tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
+    df, target_cols = generate_labels_df(solutions_csv, image_dir)
+    print(f"Loaded {len(df)} images with {len(target_cols)} regression targets.")
+
+    split_info, (train_df, val_df, test_df) = build_datasets(df, config)
+
+    train_paths = train_df['image_path'].values
+    train_labels = train_df[target_cols].values.astype(np.float32)
+    val_paths = val_df['image_path'].values
+    val_labels = val_df[target_cols].values.astype(np.float32)
+
+    # 2. Build Model
+    model, base_model = build_regression_model(architecture=config.architecture)
+
+    output_dir = config.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
     print('\n' + '=' * 60)
-    print('STAGE 1: Elliptical vs Non-Elliptical Binary Classifier')
+    print(f'TRAINING REGRESSION MODEL ({config.architecture})')
     print('=' * 60)
 
-    # Compute balanced class weights (Keras-standard formula)
-    n_ell = (train_df['label'] == 'elliptical').sum()
-    n_non_ell = (train_df['label'] != 'elliptical').sum()
-    total_s1 = n_ell + n_non_ell
-    # label 0 = non-elliptical (minority), label 1 = elliptical (majority)
-    class_weight_s1 = {
-        0: float(total_s1) / (2.0 * float(n_non_ell)),  # up-weight minority
-        1: float(total_s1) / (2.0 * float(n_ell)),      # down-weight majority
-    }
-    print(f'  Elliptical: {n_ell}, Non-elliptical: {n_non_ell}')
-    print(f'  class_weight: {{0: {class_weight_s1[0]:.3f}, 1: {class_weight_s1[1]:.3f}}}')
+    loss_fn = RMSELoss()
 
-    # Use BCE throughout Stage 1 — Focal loss causes catastrophic collapse
-    # when combined with resolution changes and layer unfreezing.
-    bce_loss = tf.keras.losses.BinaryCrossentropy()
-
-    model, base_model = build_stage1_model(architecture=config.stage1_architecture)
-
-    # ── Phase 1: Warmup @ 128px — Standard BCE (no focal, stable convergence) ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
+    # ── Phase 1: Warmup @ 128px ──
+    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (frozen backbone)')
     freeze_base(base_model)
 
-    train_ds = build_binary_dataset_stage1(
-        train_df, config.image_size_phase1, config.batch_size_phase1, config,
-        augment=True, shuffle=True,
+    train_ds = build_dataset(
+        train_paths, train_labels, config.image_size_phase1, config.batch_size_phase1,
+        center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
-    val_ds = build_binary_dataset_stage1(
-        val_df, config.image_size_phase1, config.batch_size_phase1, config,
+    val_ds = build_dataset(
+        val_paths, val_labels, config.image_size_phase1, config.batch_size_phase1,
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
     )
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(config.stage1_warmup_lr, clipnorm=1.0),
-        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for stable Phase 1
-        metrics=_binary_metrics(),
+        optimizer=tf.keras.optimizers.Adam(config.warmup_lr, clipnorm=1.0),
+        loss=loss_fn,
+        metrics=[rmse_metric],
     )
 
     h1 = model.fit(
         train_ds, validation_data=val_ds,
-        epochs=config.stage1_warmup_epochs,
-        class_weight=class_weight_s1,
+        epochs=config.warmup_epochs,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'stage1_phase1.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
+                str(output_dir / 'phase1.keras'),
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
             ),
             ConciseLogging(),
         ],
@@ -2522,665 +1151,120 @@ def _train_stage1_isolated(train_df_dict, val_df_dict, config_dict, output_dir_s
     )
 
     # ── Phase 2: Mid-tune @ 192px ──
-    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze last {config.stage1_unfreeze_phase2} layers)')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage1_unfreeze_phase2)
+    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze {config.unfreeze_phase2} layers)')
+    n_unfrozen = unfreeze_top_layers(base_model, config.unfreeze_phase2)
     print(f'  Unfrozen layers: {n_unfrozen}')
 
-    train_ds = build_binary_dataset_stage1(
-        train_df, config.image_size_phase2, config.batch_size_phase2, config,
-        augment=True, shuffle=True,
+    train_ds = build_dataset(
+        train_paths, train_labels, config.image_size_phase2, config.batch_size_phase2,
+        center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
-    val_ds = build_binary_dataset_stage1(
-        val_df, config.image_size_phase2, config.batch_size_phase2, config,
+    val_ds = build_dataset(
+        val_paths, val_labels, config.image_size_phase2, config.batch_size_phase2,
+        center_crop_ratio=config.center_crop_ratio,
     )
 
-    lr_schedule_p2 = tf.keras.optimizers.schedules.CosineDecay(
-        config.stage1_midtune_lr,
-        decay_steps=config.stage1_midtune_epochs * (len(train_df) // config.batch_size_phase2),
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        config.midtune_lr, decay_steps=config.midtune_epochs * (len(train_paths) // config.batch_size_phase2)
     )
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=bce_loss,  # Keep BCE — switching to Focal here causes collapse
-        metrics=_binary_metrics(),
+        optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
+        loss=loss_fn, metrics=[rmse_metric],
     )
 
     h2 = model.fit(
         train_ds, validation_data=val_ds,
-        epochs=config.stage1_midtune_epochs,
-        class_weight=class_weight_s1,
+        epochs=config.midtune_epochs,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'stage1_phase2.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=4, restore_best_weights=True,
+                str(output_dir / 'phase2.keras'),
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
             ),
             ConciseLogging(),
         ],
         verbose=0,
     )
 
-    # ── Phase 3: Full fine-tune @ 224px with SGDR ──
-    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze last {config.stage1_unfreeze_phase3} layers)')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage1_unfreeze_phase3)
-    print(f'  Unfrozen layers: {n_unfrozen}')
+    # ── Phase 3: Full fine-tune @ 288px ──
+    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze {config.unfreeze_phase3} layers)')
+    n_unfrozen = unfreeze_top_layers(base_model, config.unfreeze_phase3)
 
-    steps_per_epoch_p3 = len(train_df) // config.batch_size_phase3
+    # Use Gradient Accumulation if batch size is small
+    train_ds = build_dataset(
+        train_paths, train_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
+    )
+    val_ds = build_dataset(
+        val_paths, val_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio,
+    )
+
+    steps_per_epoch = len(train_paths) // config.batch_size_phase3
     lr_schedule_p3 = build_cosine_restart_schedule(
-        config.stage1_finetune_lr, steps_per_epoch_p3,
-        restart_epochs=5, t_mul=1.5, m_mul=0.9,
+        config.finetune_lr, steps_per_epoch, restart_epochs=5, t_mul=1.5, m_mul=0.9
     )
 
-    train_ds = build_binary_dataset_stage1(
-        train_df, config.image_size_phase3, config.batch_size_phase3, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage1(
-        val_df, config.image_size_phase3, config.batch_size_phase3, config,
-    )
+    active_model = model
+    if config.grad_accumulation_steps > 1:
+        active_model = GradientAccumulationModel(model, config.grad_accumulation_steps)
 
-    model.compile(
+    active_model.compile(
         optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=bce_loss,  # Keep BCE throughout
-        metrics=_binary_metrics(),
+        loss=loss_fn, metrics=[rmse_metric],
     )
 
-    h3 = model.fit(
+    h3 = active_model.fit(
         train_ds, validation_data=val_ds,
-        epochs=config.stage1_finetune_epochs,
-        class_weight=class_weight_s1,
+        epochs=config.finetune_epochs,
         callbacks=[
             tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'stage1_best.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=8, restore_best_weights=True,
+                str(output_dir / 'unified_best.keras'),
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
             ),
             ConciseLogging(),
         ],
         verbose=0,
     )
 
-    # ── SWA for Stage 1 ──
-    print('\n[Stage 1 SWA]')
-    train_ds_swa = build_binary_dataset_stage1(
-        train_df, config.image_size_phase3, config.batch_size_phase3, config,
-        augment=False, shuffle=True,
+    # ── SWA ──
+    print('\n[SWA Phase]')
+    train_ds_swa = build_dataset(
+        train_paths, train_labels, config.image_size_phase3, config.batch_size_phase3,
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=True,
     )
     model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
-    model.save(str(output_dir / 'stage1_best.keras'))
+    model.save(str(output_dir / 'unified_best.keras'))
 
-    # Save training history
-    history = {
-        'phase1': h1.history,
-        'phase2': h2.history,
-        'phase3': h3.history,
-    }
-    # Convert numpy arrays in history to lists for JSON serialization
-    for phase_key, phase_hist in history.items():
-        for metric_key, values in phase_hist.items():
-            history[phase_key][metric_key] = [float(v) for v in values]
-
-    with open(output_dir / 'stage1_history.json', 'w') as f:
-        json.dump(history, f, indent=2)
-
-    print(f'\n[Stage 1] Training complete. Model saved to {output_dir / "stage1_best.keras"}')
+    # Save details
+    save_json(split_info, output_dir / 'split_info.json')
 
     # Cleanup
     tf.keras.backend.clear_session()
     gc.collect()
 
+    return test_df, target_cols
 
-# ══════════════════════════════════════════════════════════════
-# STAGE 2 — SPIRAL vs IRREGULAR BINARY CLASSIFIER
-# ══════════════════════════════════════════════════════════════
-
-def _train_stage2_isolated(
-    train_df_dict, val_df_dict, config_dict, output_dir_str,
-    architecture, seed, model_tag,
-):
-    """Train a single Stage 2 model (spiral vs irregular) in isolated subprocess.
-
-    3-phase progressive resizing curriculum with heavier augmentation
-    and higher focal gamma for the harder spiral/irregular boundary.
-    """
-    import gc
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-    config = Config(**config_dict)
-    output_dir = Path(output_dir_str)
-    train_df = pd.DataFrame(train_df_dict)
-    val_df = pd.DataFrame(val_df_dict)
-
-    set_global_seed(seed)
-    if config.enable_mixed_precision:
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
-
-    print(f'\n{"=" * 60}')
-    print(f'STAGE 2 [{model_tag}]: Spiral vs Irregular ({architecture}, seed={seed})')
-    print(f'{"=" * 60}')
-
-    # Filter to spiral + irregular only
-    mask = train_df['label'].isin(['spiral', 'irregular'])
-    s2_train = train_df[mask].copy().reset_index(drop=True)
-    mask_val = val_df['label'].isin(['spiral', 'irregular'])
-    s2_val = val_df[mask_val].copy().reset_index(drop=True)
-
-    n_spiral = (s2_train['label'] == 'spiral').sum()
-    n_irregular = (s2_train['label'] == 'irregular').sum()
-    total_s2 = n_spiral + n_irregular
-    # label 0 = irregular (minority), label 1 = spiral (majority)
-    class_weight_s2 = {
-        0: float(total_s2) / (2.0 * float(max(n_irregular, 1))),  # up-weight irregular
-        1: float(total_s2) / (2.0 * float(max(n_spiral, 1))),     # down-weight spiral
-    }
-    print(f'  Spiral: {n_spiral}, Irregular: {n_irregular}')
-    print(f'  class_weight: {{0(irr): {class_weight_s2[0]:.3f}, 1(spi): {class_weight_s2[1]:.3f}}}')
-
-    # Focal loss for Phase 2/3 fallback
-    focal = BinaryFocalLoss(
-        gamma=config.stage2_focal_gamma,
-        pos_weight=1.0,
-        label_smoothing=config.label_smoothing,
-    )
-
-    # V26: OHEM loss for Phase 2/3 — focus on hardest spiral/irregular examples
-    ohem_loss = OHEMBinaryLoss(
-        keep_ratio=config.ohem_keep_ratio,
-        label_smoothing=config.label_smoothing,
-    )
-
-    # Adjust batch sizes for larger Stage 2 models (P100 16GB VRAM)
-    bs_p1 = config.batch_size_phase1
-    if architecture == 'ConvNeXtTiny':
-        bs_p2 = 16  # ConvNeXtTiny is heavier than EfficientNet
-        bs_p3 = 12
-    elif architecture == 'EfficientNetV2B2':
-        bs_p2 = 24
-        bs_p3 = config.batch_size_phase3
-    else:
-        bs_p2 = config.batch_size_phase2
-        bs_p3 = config.batch_size_phase3
-
-    model, base_model = build_stage2_model(architecture=architecture)
-
-    # ── Phase 1: Warmup @ 128px — Standard BCE for stability ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (standard BCE)')
-    freeze_base(base_model)
-
-    train_ds = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase1, bs_p1, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage2(
-        s2_val, config.image_size_phase1, bs_p1, config,
-    )
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(config.stage2_warmup_lr, clipnorm=1.0),
-        loss=tf.keras.losses.BinaryCrossentropy(),  # Standard BCE for Phase 1
-        metrics=_binary_metrics(),
-    )
-
-    h1 = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=config.stage2_warmup_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / f'{model_tag}_phase1.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
-            ),
-            ConciseLogging(),
-        ],
-        verbose=0,
-    )
-
-    # ── Phase 2: Mid-tune @ 192px ──
-    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze last {config.stage2_unfreeze_phase2})')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage2_unfreeze_phase2)
-    print(f'  Unfrozen layers: {n_unfrozen}')
-
-    train_ds = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase2, bs_p2, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage2(
-        s2_val, config.image_size_phase2, bs_p2, config,
-    )
-
-    lr_schedule_p2 = tf.keras.optimizers.schedules.CosineDecay(
-        config.stage2_midtune_lr,
-        decay_steps=config.stage2_midtune_epochs * (len(s2_train) // bs_p2),
-    )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p2, clipnorm=1.0),
-        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 2
-        metrics=_binary_metrics(),
-    )
-
-    h2 = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=config.stage2_midtune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / f'{model_tag}_phase2.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=5, restore_best_weights=True,
-            ),
-            ConciseLogging(),
-        ],
-        verbose=0,
-    )
-
-    # ── Phase 3: Full fine-tune @ 224px with SGDR ──
-    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze last {config.stage2_unfreeze_phase3})')
-    n_unfrozen = unfreeze_top_layers(base_model, config.stage2_unfreeze_phase3)
-    print(f'  Unfrozen layers: {n_unfrozen}')
-
-    steps_per_epoch_p3 = len(s2_train) // bs_p3
-    lr_schedule_p3 = build_cosine_restart_schedule(
-        config.stage2_finetune_lr, steps_per_epoch_p3,
-        restart_epochs=5, t_mul=1.5, m_mul=0.9,
-    )
-
-    train_ds = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase3, bs_p3, config,
-        augment=True, shuffle=True,
-    )
-    val_ds = build_binary_dataset_stage2(
-        s2_val, config.image_size_phase3, bs_p3, config,
-    )
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=ohem_loss,  # V26: OHEM for hard example mining in Phase 3
-        metrics=_binary_metrics(),
-    )
-
-    h3 = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=config.stage2_finetune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / f'{model_tag}_best.keras'),
-                monitor='val_binary_accuracy', save_best_only=True, mode='max',
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_binary_accuracy', patience=8, restore_best_weights=True,
-            ),
-            ConciseLogging(),
-        ],
-        verbose=0,
-    )
-
-    # ── SWA for Stage 2 ──
-    print(f'\n[{model_tag} SWA]')
-    train_ds_swa = build_binary_dataset_stage2(
-        s2_train, config.image_size_phase3, bs_p3, config,
-        augment=False, shuffle=True,
-    )
-    model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
-    model.save(str(output_dir / f'{model_tag}_best.keras'))
-
-    # Save history
-    history = {
-        'phase1': h1.history,
-        'phase2': h2.history,
-        'phase3': h3.history,
-    }
-    for phase_key, phase_hist in history.items():
-        for metric_key, values in phase_hist.items():
-            history[phase_key][metric_key] = [float(v) for v in values]
-
-    with open(output_dir / f'{model_tag}_history.json', 'w') as f:
-        json.dump(history, f, indent=2)
-
-    print(f'\n[{model_tag}] Training complete. Model saved to {output_dir / f"{model_tag}_best.keras"}')
-
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-
-# ══════════════════════════════════════════════════════════════
-# CASCADE TRAINING ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════
-
-def run_cascade_training(train_df, val_df, config: Config, output_dir: Path) -> dict:
-    """Orchestrate the full cascade training pipeline.
-
-    Order:
-    1. Train Stage 1 (elliptical binary) on full dataset
-    2. Train Stage 2 models (spiral vs irregular) on non-elliptical subset
-    3. Each stage runs in a separate subprocess for VRAM isolation
-    """
-    import multiprocessing
-
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
-    config_dict = asdict(config)
-    output_dir_str = str(output_dir)
-    train_df_dict = train_df.to_dict()
-    val_df_dict = val_df.to_dict()
-
-    results = {}
-
-    # ── 1. Train Stage 1 ──
-    print('\n' + '=' * 70)
-    print('TRAINING STAGE 1: Elliptical vs Non-Elliptical')
-    print('=' * 70)
-    t0 = time.time()
-
-    p = multiprocessing.Process(
-        target=_train_stage1_isolated,
-        args=(train_df_dict, val_df_dict, config_dict, output_dir_str),
-    )
-    p.start()
-    p.join()
-
-    if p.exitcode != 0:
-        raise RuntimeError(f'Stage 1 training failed with exit code {p.exitcode}')
-
-    stage1_time = time.time() - t0
-    print(f'\nStage 1 completed in {stage1_time / 60:.1f} minutes')
-
-    with open(output_dir / 'stage1_history.json', 'r') as f:
-        results['stage1'] = json.load(f)
-
-    # ── 2. Train Stage 2 (multiple ensemble models) ──
-    print('\n' + '=' * 70)
-    print('TRAINING STAGE 2: Spiral vs Irregular (Ensemble)')
-    print('=' * 70)
-
-    stage2_results = {}
-    for i, (arch, seed) in enumerate(zip(config.stage2_architectures, config.stage2_seeds)):
-        model_tag = f'stage2_{arch}_seed{seed}'
-        t0 = time.time()
-
-        p = multiprocessing.Process(
-            target=_train_stage2_isolated,
-            args=(
-                train_df_dict, val_df_dict, config_dict, output_dir_str,
-                arch, seed, model_tag,
-            ),
-        )
-        p.start()
-        p.join()
-
-        if p.exitcode != 0:
-            raise RuntimeError(f'Stage 2 [{model_tag}] training failed with exit code {p.exitcode}')
-
-        stage2_time = time.time() - t0
-        print(f'\n{model_tag} completed in {stage2_time / 60:.1f} minutes')
-
-        with open(output_dir / f'{model_tag}_history.json', 'r') as f:
-            stage2_results[model_tag] = json.load(f)
-
-    results['stage2'] = stage2_results
-
-    return results
-
-
-# ══════════════════════════════════════════════════════════════
-# FALLBACK — RE-TRAIN STAGE 2 WITH RELAXED THRESHOLDS
-# ══════════════════════════════════════════════════════════════
-
-def run_stage2_fallback(train_df, val_df, config: Config, output_dir: Path) -> dict:
-    """Re-train Stage 2 with relaxed thresholds and stronger regularization.
-
-    Triggered automatically if irregular_f1 < 0.75 after initial training.
-    """
-    import multiprocessing
-
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
-    print('\n' + '!' * 70)
-    print('FALLBACK: Re-training Stage 2 with relaxed thresholds')
-    print('!' * 70)
-
-    # Apply fallback config changes
-    config_dict = asdict(config)
-    config_dict['stage2_focal_gamma'] = config.fallback_stage2_focal_gamma
-
-    output_dir_str = str(output_dir)
-    train_df_dict = train_df.to_dict()
-    val_df_dict = val_df.to_dict()
-
-    stage2_results = {}
-    for i, (arch, seed) in enumerate(zip(config.stage2_architectures, config.stage2_seeds)):
-        model_tag = f'stage2_{arch}_seed{seed}_fallback'
-
-        p = multiprocessing.Process(
-            target=_train_stage2_isolated,
-            args=(
-                train_df_dict, val_df_dict, config_dict, output_dir_str,
-                arch, seed, model_tag,
-            ),
-        )
-        p.start()
-        p.join()
-
-        if p.exitcode != 0:
-            print(f'WARNING: Fallback {model_tag} failed with exit code {p.exitcode}')
-            continue
-
-        with open(output_dir / f'{model_tag}_history.json', 'r') as f:
-            stage2_results[model_tag] = json.load(f)
-
-    return stage2_results
-
-
-# ══════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ══════════════════════════════════════════════════════════════
 
 def main():
+    t0 = time.time()
     config = Config()
 
-    if config.enable_mixed_precision:
-        policy = tf.keras.mixed_precision.Policy('mixed_float16')
-        tf.keras.mixed_precision.set_global_policy(policy)
-        print(f'Mixed precision enabled: {policy.name}')
-
-    output_dir = config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    setup_environment(config)
-
-    # ── Dataset setup ──
     if is_kaggle_runtime():
+        print("Running in Kaggle environment.")
         solutions_csv, image_dir = setup_kaggle_environment(config)
-        labels_csv = output_dir / 'labels.csv'
     else:
-        solutions_csv = Path('training_solutions_rev1.csv')
-        image_dir = Path('images')
-        labels_csv = output_dir / 'labels.csv'
+        print("Running in local/VM environment.")
+        setup_environment(config)
+        solutions_csv = Path("training_solutions_rev1.csv")
+        image_dir = Path("images_training_rev1")
 
-    # Always regenerate labels with V25 thresholds
-    labels_df = generate_labels_df(solutions_csv, image_dir, config)
-    labels_df.to_csv(labels_csv, index=False)
+    # Pipeline
+    test_df, target_cols = train_unified_regression(config, solutions_csv, image_dir)
 
-    # Validate class counts
-    validate_class_counts(labels_df, config)
+    print(f"\nTraining pipeline completed in {(time.time() - t0) / 60:.1f} minutes.")
 
-    # Split data
-    class_counts, split_info, (train_df, val_df, test_df) = build_datasets(labels_df, config)
-
-    print('\n=== Dataset Split ===')
-    print(f'  Train: {len(train_df)}')
-    print(f'  Val:   {len(val_df)}')
-    print(f'  Test:  {len(test_df)}')
-    print(f'  Class distribution: {class_counts}')
-
-    # ── Run cascade training ──
-    start_time = time.time()
-    training_results = run_cascade_training(train_df, val_df, config, output_dir)
-    total_train_time = time.time() - start_time
-    print(f'\nTotal training time: {total_train_time / 60:.1f} minutes')
-
-    # ── Evaluate cascade pipeline ──
-    print('\n' + '=' * 70)
-    print('CASCADE EVALUATION')
-    print('=' * 70)
-
-    # Collect Stage 2 model paths
-    stage2_model_paths = []
-    for arch, seed in zip(config.stage2_architectures, config.stage2_seeds):
-        tag = f'stage2_{arch}_seed{seed}'
-        model_path = output_dir / f'{tag}_best.keras'
-        if model_path.exists():
-            stage2_model_paths.append(str(model_path))
-
-    eval_results = evaluate_cascade(
-        stage1_model_path=str(output_dir / 'stage1_best.keras'),
-        stage2_model_paths=stage2_model_paths,
-        test_df=test_df,
-        val_df=val_df,
-        config=config,
-        output_dir=output_dir,
-    )
-
-    # ── V26: XGBoost Stacking ──
-    if config.use_xgboost_stacking:
-        print('\n' + '=' * 70)
-        print('V26: XGBOOST META-LEARNER STACKING')
-        print('=' * 70)
-
-        from stacking import extract_features, train_xgboost_stacker, predict_with_stacker
-
-        # Collect ALL model paths for feature extraction
-        all_model_paths = [str(output_dir / 'stage1_best.keras')] + stage2_model_paths
-
-        print('\n[Stacking] Extracting deep features...')
-        train_features = extract_features(all_model_paths, train_df, config)
-        val_features = extract_features(all_model_paths, val_df, config)
-        test_features = extract_features(all_model_paths, test_df, config)
-
-        train_labels = train_df['label_id'].to_numpy()
-        val_labels = val_df['label_id'].to_numpy()
-        test_labels = test_df['label_id'].to_numpy()
-
-        xgb_model = train_xgboost_stacker(
-            train_features, train_labels,
-            val_features, val_labels,
-            config,
-            output_path=output_dir / 'xgb_stacker.pkl',
-        )
-
-        # Evaluate stacked model on test set
-        xgb_preds, xgb_probs = predict_with_stacker(xgb_model, test_features)
-        xgb_acc = float(np.mean(xgb_preds == test_labels))
-        print(f'\n[Stacking] XGBoost Test Accuracy: {xgb_acc:.4f}')
-
-        # Store stacking results in eval_results
-        eval_results['xgboost_stacking'] = {
-            'test_accuracy': xgb_acc,
-            'feature_dim': train_features.shape[1],
-            'n_models': len(all_model_paths),
-        }
-
-    # ── Check if fallback is needed ──
-    irregular_f1 = eval_results.get('cascade_evaluation', {}).get(
-        'classification_report', {}
-    ).get('irregular', {}).get('f1-score', 0.0)
-
-    fallback_triggered = False
-    if irregular_f1 < 0.75:
-        print(f'\n⚠️ Irregular F1 = {irregular_f1:.4f} < 0.75 — triggering Stage 2 fallback!')
-        fallback_triggered = True
-
-        fallback_results = run_stage2_fallback(train_df, val_df, config, output_dir)
-
-        # Re-evaluate with fallback models
-        fallback_model_paths = []
-        for arch, seed in zip(config.stage2_architectures, config.stage2_seeds):
-            tag = f'stage2_{arch}_seed{seed}_fallback'
-            model_path = output_dir / f'{tag}_best.keras'
-            if model_path.exists():
-                fallback_model_paths.append(str(model_path))
-
-        if fallback_model_paths:
-            eval_results_fallback = evaluate_cascade(
-                stage1_model_path=str(output_dir / 'stage1_best.keras'),
-                stage2_model_paths=fallback_model_paths,
-                test_df=test_df,
-                val_df=val_df,
-                config=config,
-                output_dir=output_dir,
-            )
-            # Use fallback results if better
-            fallback_irr_f1 = eval_results_fallback.get('cascade_evaluation', {}).get(
-                'classification_report', {}
-            ).get('irregular', {}).get('f1-score', 0.0)
-            if fallback_irr_f1 > irregular_f1:
-                eval_results = eval_results_fallback
-                eval_results['fallback_triggered'] = True
-
-    # ── Compile final metrics ──
-    import datetime
-
-    final_metrics = {
-        'run_id': 'v25_cascade_224px',
-        'timestamp': datetime.datetime.now().isoformat(),
-        'training_time_minutes': total_train_time / 60,
-        'dataset': split_info,
-        'stage1': {
-            'architecture': config.stage1_architecture,
-            'image_size_phases': [config.image_size_phase1, config.image_size_phase2, config.image_size_phase3],
-            'model_path': str(output_dir / 'stage1_best.keras'),
-            'training_history': training_results.get('stage1', {}),
-        },
-        'stage2': {
-            'architectures': [f'{a}_seed{s}' for a, s in zip(config.stage2_architectures, config.stage2_seeds)],
-            'image_size_phases': [config.image_size_phase1, config.image_size_phase2, config.image_size_phase3],
-            'model_paths': stage2_model_paths,
-            'training_history': training_results.get('stage2', {}),
-        },
-        'cascade_evaluation': eval_results.get('cascade_evaluation', {}),
-        'swa_applied': True,
-        'tta_n_augments': config.tta_n_augments,
-        'fallback_triggered': fallback_triggered,
-    }
-
-    save_json(output_dir / 'metrics.json', final_metrics)
-
-    # ── Final report ──
-    cascade_eval = eval_results.get('cascade_evaluation', {})
-    print('\n' + '=' * 60)
-    print('FINAL RESULTS — GalaxyNet V25 Cascade Pipeline')
-    print('=' * 60)
-    print(f"  Test Accuracy (standard): {cascade_eval.get('test_accuracy_standard', 'N/A')}")
-    print(f"  Test Accuracy (TTA-16):   {cascade_eval.get('test_accuracy_tta', 'N/A')}")
-    print(f"  Cohen's Kappa:            {cascade_eval.get('cohen_kappa', 'N/A')}")
-    print(f"  Matthews CorrCoef:        {cascade_eval.get('matthews_corrcoef', 'N/A')}")
-
-    report = cascade_eval.get('classification_report', {})
-    print(f"\n  Per-class F1:")
-    for cls in CLASS_NAMES:
-        cls_data = report.get(cls, {})
-        print(f"    {cls:>12s}: P={cls_data.get('precision', 0):.4f}  R={cls_data.get('recall', 0):.4f}  F1={cls_data.get('f1-score', 0):.4f}")
-
-    targets = cascade_eval.get('min_targets_met', {})
-    print(f"\n  Acceptance Criteria:")
-    for key, met in targets.items():
-        status = '✓' if met else '✗'
-        print(f"    {status} {key}: {'PASS' if met else 'FAIL'}")
-
-    print(f"\n  Fallback triggered: {fallback_triggered}")
-    print(f"  All outputs saved to: {output_dir}")
-    print('=' * 60)
+    # Run evaluation
+    evaluate_regression(config, test_df, target_cols)
 
 
 if __name__ == '__main__':

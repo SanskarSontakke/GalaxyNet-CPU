@@ -23,75 +23,37 @@ def _get_backbone(architecture: str, input_tensor: tf.Tensor) -> tf.keras.Model:
     )
 
 
-def build_stage1_model(
-    architecture: str = 'EfficientNetV2B1',
-) -> tuple[tf.keras.Model, tf.keras.Model]:
-    """Build Stage 1 binary classifier: Elliptical vs Non-Elliptical.
-    
-    Architecture: backbone → GAP → BN → Dense(256) → BN → ReLU → 
-                  Dropout(0.35) → Dense(1, sigmoid)
-    
-    Returns:
-        (full_model, base_model) tuple for progressive unfreezing.
-    """
-    # Dynamic input shape for resolution curriculum
-    inputs = tf.keras.Input(shape=(None, None, 3), name='stage1_input')
-    base_model = _get_backbone(architecture, inputs)
-
-    x = tf.keras.layers.GlobalAveragePooling2D(name='stage1_gap')(base_model.output)
-    x = tf.keras.layers.BatchNormalization(name='stage1_bn1')(x)
-    x = tf.keras.layers.Dense(256, name='stage1_dense1')(x)
-    x = tf.keras.layers.BatchNormalization(name='stage1_bn2')(x)
-    x = tf.keras.layers.Activation('relu', name='stage1_relu')(x)
-    x = tf.keras.layers.Dropout(0.35, name='stage1_dropout')(x)
-    # Sigmoid output for binary classification, float32 for mixed precision
-    outputs = tf.keras.layers.Dense(
-        1, activation='sigmoid', dtype='float32', name='stage1_output'
-    )(x)
-
-    model = tf.keras.Model(
-        inputs=inputs, outputs=outputs,
-        name=f'GalaxyNet_Stage1_{architecture}',
-    )
-    return model, base_model
-
-
-def build_stage2_model(
+def build_regression_model(
     architecture: str = 'EfficientNetV2B2',
 ) -> tuple[tf.keras.Model, tf.keras.Model]:
-    """Build Stage 2 binary classifier: Spiral vs Irregular.
+    """Build unified regression model: Predicts all 37 Galaxy Zoo probabilities.
     
     Architecture: backbone → GAP → BN → Dense(512) → BN → GELU → 
-                  Dropout(0.4) → Dense(256) → BN → GELU → 
-                  Dropout(0.3) → Dense(1, sigmoid)
+                  Dropout(0.4) → Dense(37, sigmoid)
     
-    Deeper head than Stage 1 because spiral/irregular boundary is harder.
-    GELU activation for smoother gradients on the difficult boundary.
+    Using Sigmoid on the final layer logically bounds all voting fractions to [0.0, 1.0].
     
     Returns:
         (full_model, base_model) tuple for progressive unfreezing.
     """
-    inputs = tf.keras.Input(shape=(None, None, 3), name='stage2_input')
+    inputs = tf.keras.Input(shape=(None, None, 3), name='image_input')
     base_model = _get_backbone(architecture, inputs)
 
-    x = tf.keras.layers.GlobalAveragePooling2D(name='stage2_gap')(base_model.output)
-    x = tf.keras.layers.BatchNormalization(name='stage2_bn1')(x)
-    x = tf.keras.layers.Dense(512, name='stage2_dense1')(x)
-    x = tf.keras.layers.BatchNormalization(name='stage2_bn2')(x)
-    x = tf.keras.layers.Activation('gelu', name='stage2_gelu1')(x)
-    x = tf.keras.layers.Dropout(0.4, name='stage2_dropout1')(x)
-    x = tf.keras.layers.Dense(256, name='stage2_dense2')(x)
-    x = tf.keras.layers.BatchNormalization(name='stage2_bn3')(x)
-    x = tf.keras.layers.Activation('gelu', name='stage2_gelu2')(x)
-    x = tf.keras.layers.Dropout(0.3, name='stage2_dropout2')(x)
-    # Sigmoid output for binary classification
+    x = tf.keras.layers.GlobalAveragePooling2D(name='gap')(base_model.output)
+    x = tf.keras.layers.BatchNormalization(name='bn1')(x)
+    x = tf.keras.layers.Dense(512, name='dense1')(x)
+    x = tf.keras.layers.BatchNormalization(name='bn2')(x)
+    x = tf.keras.layers.Activation('gelu', name='gelu1')(x)
+    x = tf.keras.layers.Dropout(0.4, name='dropout1')(x)
+    
+    # 37 dimensional output bounded to [0, 1] interval natively using sigmoid
     outputs = tf.keras.layers.Dense(
-        1, activation='sigmoid', dtype='float32', name='stage2_output'
+        37, activation='sigmoid', dtype='float32', name='regression_output'
     )(x)
 
     model = tf.keras.Model(
         inputs=inputs, outputs=outputs,
-        name=f'GalaxyNet_Stage2_{architecture}',
+        name=f'GalaxyNet_UnifiedRegression_{architecture}',
     )
     return model, base_model
 
