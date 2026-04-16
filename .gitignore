@@ -2,3 +2,6 @@ data
 galaxy_raw
 outputs
 .venv
+*.keras
+*.json
+__pycache__/
