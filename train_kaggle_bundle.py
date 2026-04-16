@@ -1236,7 +1236,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     model.save(str(output_dir / 'unified_best.keras'))
 
     # Save details
-    save_json(split_info, output_dir / 'split_info.json')
+    save_json(output_dir / 'split_info.json', split_info)
 
     # Cleanup
     tf.keras.backend.clear_session()
