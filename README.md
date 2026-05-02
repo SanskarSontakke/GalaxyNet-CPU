@@ -5,16 +5,22 @@ Production-grade deep learning pipeline designed to predict the exact fractional
 > [!TIP]
 > **Curious about the math?** Start by reading the [Technical Deep Dive Guide](TECHNICAL_GUIDE.md) for architectural block diagrams and progressive resizing strategies.
 
-## Architecture: Unified Neural Regression
+## Architecture: Benanne-Inspired Regression
 
 ```text
-Input (288×288) → Preprocessing (Poisson Noise + Continuous Rotation)
+Input (424×424) → Benanne Affine Augmentation
                         ↓
-                EfficientNetV2
+       69×69 View + 45° Rotated View
                         ↓
-             Global Average Pooling
+        16 Aligned 45×45 Shared Parts
                         ↓
-         Dense(37, activation='sigmoid')  ← Forces bounds to [0.0, 1.0]
+              Shared 4-Layer ConvNet
+                        ↓
+            2× Maxout Dense(2048)
+                        ↓
+                Dense(37 logits)
+                        ↓
+      GalaxyOutputLayer (tree normalization + weighting)
                         ↓
            TTA Averaged Output Float32
 ```
@@ -26,12 +32,11 @@ Input (288×288) → Preprocessing (Poisson Noise + Continuous Rotation)
 
 ## Key Features
 
-- **3-Phase Resolution Curriculum**: 128px → 192px → 288px progressive resizing limits computation overhead during early generic filter learning.
-- **Cosine Annealing with Warm Restarts (SGDR)**: Escapes shallow saddle points at high-resolution extraction stages.
-- **Stochastic Weight Averaging (SWA)**: Traverses the final error-space manifold to compute the optimal median weight state, boosting generalization implicitly.
-- **Direct RMSE Optimization**: Native `RMSELoss` function directly maps the PyTorch/TensorFlow gradients to mirror Kaggle’s Public Leaderboard validation metrics.
-- **Physics-Informed Augmentations**: Instead of generic horizontal flips, we utilize Continuous 360° Rotations, Point-Spread Function (PSF) blur, and Poisson CCD variance simulating actual Hubble Space Telescope captures.
-- **16-TTA Optimization**: Final evaluation uses Test-Time Augmentation (4 rotations × 2 flips × 2 crops) to stabilize test-boundary precision.
+- **Benanne-Inspired View Logic**: Regular and 45° rotated views are split into 16 aligned 45×45 parts before feature extraction.
+- **Ordered 90/10 Validation Split**: Matches the legacy benanne validation protocol more closely than the earlier random split.
+- **Direct RMSE Optimization**: Native `RMSELoss` is applied after tree-aware normalization so validation and inference score the same object.
+- **Benanne Affine Augmentations**: Random rotation, zoom, translation, flip, and color perturbation are ported from the winning solution logic.
+- **60-TTA Optimization**: Final evaluation and submission use 10 rotations × 3 zoom scales × 2 flips.
 
 ## Repository Layout
 
@@ -43,7 +48,7 @@ galaxynet/
 ├── losses.py              # Custom RMSE metric and Loss objects
 ├── train.py               # Linear 3-Phase orchestrator (runs without multiprocessing logic)
 ├── evaluate.py            # Global Multi-Target TTA RMSE Evaluation 
-├── utils.py               # SWA, LLRD, SGDR Learning Schedules
+├── utils.py               # Runtime setup, environment resolution, helper utilities
 ├── scripts/
 │   ├── consolidate.py     # Compiles runtime codebase into a single Kaggle script
 │   └── pack_dataset.py
@@ -74,9 +79,9 @@ pip install -r requirements.txt
 1. Extracts Kaggle *Galaxy Zoo - The Galaxy Challenge* data cleanly into the local environment.
 2. Formats all 37 targets into `float32` bounding targets natively.
 3. Warmup Phase (128x128 bounding boxes, frozen core).
-4. Mid-Tune Phase (192x192 partial unfreezing, Cosine decay).
-5. Fine-Tune Phase (288x288, extensive SGDR cyclical drops).
-6. Tests final state space via 16-TTA and exports predictions to standard Kaggle formulation.
+4. Mid-Tune Phase (same architecture, lower SGD learning rate).
+5. Fine-Tune Phase (continued full-resolution training with lower LR).
+6. Evaluates on the held-out validation split and exports a competition-format `submission.csv.gz`.
 
 ## Expected Results
 
@@ -96,6 +101,7 @@ outputs/
 ├── phase2.keras                       # 192px tuned core
 ├── unified_best.keras                 # Fully optimized model (Final)
 ├── evaluation_results.json            # Final metrics dictionary
+├── submission.csv.gz                  # Competition-format submission file
 └── split_info.json
 ```
 
@@ -105,7 +111,7 @@ outputs/
 |-----------|---------------|---------------|
 | Phase 1 (128px Warmup) | ~30 min | ~18 min |
 | Phase 2 (192px Mid-Tune) | ~45 min | ~25 min |
-| Phase 3 (288px Fine Tune) | ~2.5 hrs | ~1.5 hrs |
+| BenanneNetTF Full-Resolution Train | ~2.5 hrs | ~1.5 hrs |
 | **Total** | **~3.9 hours** | **~2.2 hours** |
 
 _Runs comfortably within the standard Kaggle 12-hour session quota limits without Out-Of-Memory interrupts due to the un-looped batch scaling protocol._

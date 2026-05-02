@@ -10,7 +10,15 @@ from tqdm import tqdm
 # Import local components
 from config import Config
 from dataset import build_dataset
-from losses import RMSELoss, rmse_metric
+from losses import HierarchicalRMSELoss, RMSELoss, rmse_metric
+from model import (
+    BenannePartExtractor,
+    GalaxyOutputLayer,
+    MaxoutDense,
+    MultiViewAverage,
+    MultiViewLayer,
+    PartFeatureMerge,
+)
 
 def calculate_per_target_rmse(y_true, y_pred, target_cols):
     """Calculates RMSE for each individual target column."""
@@ -49,9 +57,20 @@ def main():
     print(f"Loading model from {MODEL_PATH}...")
     custom_objects = {
         'RMSELoss': RMSELoss,
+        'HierarchicalRMSELoss': HierarchicalRMSELoss,
         'rmse_metric': rmse_metric,
+        'GalaxyOutputLayer': GalaxyOutputLayer,
+        'MultiViewLayer': MultiViewLayer,
+        'MultiViewAverage': MultiViewAverage,
+        'BenannePartExtractor': BenannePartExtractor,
+        'PartFeatureMerge': PartFeatureMerge,
+        'MaxoutDense': MaxoutDense,
     }
-    model = tf.keras.models.load_model(MODEL_PATH, custom_objects=custom_objects)
+    model = tf.keras.models.load_model(
+        MODEL_PATH,
+        custom_objects=custom_objects,
+        compile=False,
+    )
     
     # 3. Prepare dataset
     test_paths = df['image_path'].values
@@ -61,7 +80,8 @@ def main():
     print("\nRunning standard prediction (No TTA)...")
     ds = build_dataset(
         test_paths, np.zeros_like(y_true), config.image_size_phase3, batch_size=16,
-        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False
+        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
+        drop_remainder=False
     )
     t0 = time.time()
     y_pred_std = model.predict(ds, verbose=1)
@@ -73,7 +93,8 @@ def main():
     for i in range(3):
         ds_aug = build_dataset(
             test_paths, np.zeros_like(y_true), config.image_size_phase3, batch_size=16,
-            center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=False
+            center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
+            drop_remainder=False, tta_index=i + 1
         )
         preds = model.predict(ds_aug, verbose=1)
         tta_preds.append(preds)

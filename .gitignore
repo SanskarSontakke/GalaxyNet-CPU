@@ -5,3 +5,5 @@ outputs
 *.keras
 *.json
 __pycache__/
+*.pyc
+kaggle_logs/

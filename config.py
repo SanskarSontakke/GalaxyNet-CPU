@@ -1,47 +1,47 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 import tensorflow as tf
-
 
 @dataclass
 class Config:
     # ── Paths ──────────────────────────────────────────────────
     kaggle_input_dir: Path = Path('/kaggle/input/galaxy-zoo-the-galaxy-challenge')
     kaggle_temp_dir: Path = Path('/kaggle/temp')
-    output_dir: Path = Path('/kaggle/working/outputs')
+    output_dir: Path = Path('outputs')
 
     # ── Image resolution curriculum ────────────────────────────
-    image_size_phase1: int = 128
-    image_size_phase2: int = 192
-    image_size_phase3: int = 384  
-    center_crop_ratio: float = 0.75
+    image_size_phase1: int = 424
+    image_size_phase2: int = 424
+    image_size_phase3: int = 424
+    center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device) ──────────────────────────
+    # ── Batch sizes (BASE per device - Optimized for T4 16GB) ──
     batch_size_phase1: int = 16
-    batch_size_phase2: int = 8
-    batch_size_phase3: int = 4
-    grad_accumulation_steps: int = 1 
+    batch_size_phase2: int = 16
+    batch_size_phase3: int = 16
+    grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
     seed: int = 42
-    val_split: float = 0.15
-    test_split: float = 0.10
+    val_split: float = 0.10
+    test_split: float = 0.00
+    legacy_ordered_split: bool = True
 
     # ── Model Architecture ─────────────────────────────────────
-    architecture: str = 'EfficientNetV2B2'
-    multi_view: bool = True  
+    architecture: str = 'BenanneNetTF'
+    multi_view: bool = False
     
-    # ── Training Schedule (MINIMUM FOR TESTING) ────────────────
-    warmup_epochs: int = 1   
-    midtune_epochs: int = 1   
-    finetune_epochs: int = 1  
+    # ── Training Schedule ──────────────────────────────────────
+    warmup_epochs: int = 8
+    midtune_epochs: int = 10
+    finetune_epochs: int = 12
     
-    warmup_lr: float = 2e-4   
-    midtune_lr: float = 2e-5
-    finetune_lr: float = 5e-6
+    warmup_lr: float = 4e-2
+    midtune_lr: float = 4e-3
+    finetune_lr: float = 4e-4
     
     unfreeze_phase2: int = 50
     unfreeze_phase3: int = 100 
@@ -59,12 +59,13 @@ class Config:
     augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)
 
     # ── SWA ────────────────────────────────────────────────────
-    swa_epochs: int = 1  # Minimum
-    swa_lr_high: float = 1e-5
-    swa_lr_low: float = 2e-6
+    swa_epochs: int = 0
+    swa_lr_high: float = 5e-6
+    swa_lr_low: float = 1e-6
 
     # ── TTA ────────────────────────────────────────────────────
-    tta_n_augments: int = 2 # Minimum 
+    tta_n_augments: int = 60
+    submission_filename: str = 'submission.csv.gz'
 
     # ── Runtime ────────────────────────────────────────────────
     enable_mixed_precision: bool = True

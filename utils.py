@@ -58,7 +58,6 @@ def setup_environment(config: Config) -> None:
         
         policy = 'mixed_bfloat16' if is_tpu else 'mixed_float16'
         tf.keras.mixed_precision.set_global_policy(policy)
-        print(f"Hardware-aware mixed precision policy set to: {policy}")
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
@@ -83,13 +82,11 @@ def _extract_zip_if_needed(zip_path: Path, output_dir: Path) -> None:
         zf.extractall(output_dir)
 
 
-def setup_kaggle_environment(config: Config) -> Tuple[Path, Path]:
-    # Look for files more broadly if not found in specific path
-    search_roots = [config.kaggle_input_dir, Path('/kaggle/input')]
-    
+def _resolve_competition_environment(search_roots: list[Path], temp_dir: Path) -> Tuple[Path, Path, Path, Path]:
     def find_robustly(name: str):
         for root in search_roots:
-            if not root.exists(): continue
+            if not root.exists():
+                continue
             try:
                 return find_kaggle_file(root, name)
             except FileNotFoundError:
@@ -102,27 +99,59 @@ def setup_kaggle_environment(config: Config) -> Tuple[Path, Path]:
     except FileNotFoundError:
         # If not, find and extract zip
         train_csv_zip = find_robustly('training_solutions_rev1.zip')
-        _extract_zip_if_needed(train_csv_zip, config.kaggle_temp_dir)
-        csv_path = find_kaggle_file(config.kaggle_temp_dir, 'training_solutions_rev1.csv')
+        _extract_zip_if_needed(train_csv_zip, temp_dir)
+        csv_path = find_kaggle_file(temp_dir, 'training_solutions_rev1.csv')
 
-    # Try to find image dir directly
+    # Try to find training image dir directly
     try:
-        # Check for a few jpgs to confirm it's the right dir
         image_dir_candidate = find_robustly('images_training_rev1')
         if not image_dir_candidate.is_dir():
-             # maybe it's the zip name, try to find a subfolder
-             raise FileNotFoundError
-        csv_path_check = list(Path(image_dir_candidate).glob('*.jpg'))
-        if len(csv_path_check) < 10:
-             raise FileNotFoundError
-        image_dir = image_dir_candidate
+            raise FileNotFoundError
+        train_check = list(Path(image_dir_candidate).glob('*.jpg'))
+        if len(train_check) < 10:
+            raise FileNotFoundError
+        train_image_dir = image_dir_candidate
     except FileNotFoundError:
-        # If not, find and extract zip
         image_zip = find_robustly('images_training_rev1.zip')
-        _extract_zip_if_needed(image_zip, config.kaggle_temp_dir)
-        image_dir = find_kaggle_file(config.kaggle_temp_dir, 'images_training_rev1')
+        _extract_zip_if_needed(image_zip, temp_dir)
+        train_image_dir = find_kaggle_file(temp_dir, 'images_training_rev1')
 
-    return Path(csv_path), Path(image_dir)
+    # Try to find test image dir directly
+    try:
+        test_dir_candidate = find_robustly('images_test_rev1')
+        if not test_dir_candidate.is_dir():
+            raise FileNotFoundError
+        test_check = list(Path(test_dir_candidate).glob('*.jpg'))
+        if len(test_check) < 10:
+            raise FileNotFoundError
+        test_image_dir = test_dir_candidate
+    except FileNotFoundError:
+        test_zip = find_robustly('images_test_rev1.zip')
+        _extract_zip_if_needed(test_zip, temp_dir)
+        test_image_dir = find_kaggle_file(temp_dir, 'images_test_rev1')
+
+    try:
+        submission_template_path = find_robustly('all_zeros_benchmark.zip')
+    except FileNotFoundError:
+        submission_template_path = find_robustly('all_zeros_benchmark.csv')
+
+    return (
+        Path(csv_path),
+        Path(train_image_dir),
+        Path(test_image_dir),
+        Path(submission_template_path),
+    )
+
+
+def setup_kaggle_environment(config: Config) -> Tuple[Path, Path, Path, Path]:
+    search_roots = [config.kaggle_input_dir, Path('/kaggle/input')]
+    return _resolve_competition_environment(search_roots, config.kaggle_temp_dir)
+
+
+def setup_local_environment(config: Config) -> Tuple[Path, Path, Path, Path]:
+    local_root = Path('galaxy_raw')
+    search_roots = [local_root]
+    return _resolve_competition_environment(search_roots, local_root)
 
 
 def save_json(path: Path, payload: dict) -> None:

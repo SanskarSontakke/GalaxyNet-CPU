@@ -55,43 +55,43 @@ except ImportError:
 
 
 
-
 @dataclass
 class Config:
     # ── Paths ──────────────────────────────────────────────────
     kaggle_input_dir: Path = Path('/kaggle/input/galaxy-zoo-the-galaxy-challenge')
     kaggle_temp_dir: Path = Path('/kaggle/temp')
-    output_dir: Path = Path('/kaggle/working/outputs')
+    output_dir: Path = Path('outputs')
 
     # ── Image resolution curriculum ────────────────────────────
-    image_size_phase1: int = 128
-    image_size_phase2: int = 192
-    image_size_phase3: int = 384
-    center_crop_ratio: float = 0.75
+    image_size_phase1: int = 424
+    image_size_phase2: int = 424
+    image_size_phase3: int = 424
+    center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device) ──────────────────────────
+    # ── Batch sizes (BASE per device - Optimized for T4 16GB) ──
     batch_size_phase1: int = 16
-    batch_size_phase2: int = 8
-    batch_size_phase3: int = 4
-    grad_accumulation_steps: int = 1
+    batch_size_phase2: int = 16
+    batch_size_phase3: int = 16
+    grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
     seed: int = 42
-    val_split: float = 0.15
-    test_split: float = 0.10
+    val_split: float = 0.10
+    test_split: float = 0.00
+    legacy_ordered_split: bool = True
 
     # ── Model Architecture ─────────────────────────────────────
-    architecture: str = 'EfficientNetV2B2'
-    multi_view: bool = True
+    architecture: str = 'BenanneNetTF'
+    multi_view: bool = False
 
-    # ── Training Schedule (MINIMUM FOR TESTING) ────────────────
-    warmup_epochs: int = 1
-    midtune_epochs: int = 1
-    finetune_epochs: int = 1
+    # ── Training Schedule ──────────────────────────────────────
+    warmup_epochs: int = 8
+    midtune_epochs: int = 10
+    finetune_epochs: int = 12
 
-    warmup_lr: float = 2e-4
-    midtune_lr: float = 2e-5
-    finetune_lr: float = 5e-6
+    warmup_lr: float = 4e-2
+    midtune_lr: float = 4e-3
+    finetune_lr: float = 4e-4
 
     unfreeze_phase2: int = 50
     unfreeze_phase3: int = 100
@@ -109,12 +109,13 @@ class Config:
     augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)
 
     # ── SWA ────────────────────────────────────────────────────
-    swa_epochs: int = 1  # Minimum
-    swa_lr_high: float = 1e-5
-    swa_lr_low: float = 2e-6
+    swa_epochs: int = 0
+    swa_lr_high: float = 5e-6
+    swa_lr_low: float = 1e-6
 
     # ── TTA ────────────────────────────────────────────────────
-    tta_n_augments: int = 2 # Minimum
+    tta_n_augments: int = 60
+    submission_filename: str = 'submission.csv.gz'
 
     # ── Runtime ────────────────────────────────────────────────
     enable_mixed_precision: bool = True
@@ -177,7 +178,6 @@ def setup_environment(config: Config) -> None:
 
         policy = 'mixed_bfloat16' if is_tpu else 'mixed_float16'
         tf.keras.mixed_precision.set_global_policy(policy)
-        print(f"Hardware-aware mixed precision policy set to: {policy}")
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
@@ -202,13 +202,11 @@ def _extract_zip_if_needed(zip_path: Path, output_dir: Path) -> None:
         zf.extractall(output_dir)
 
 
-def setup_kaggle_environment(config: Config) -> Tuple[Path, Path]:
-    # Look for files more broadly if not found in specific path
-    search_roots = [config.kaggle_input_dir, Path('/kaggle/input')]
-
+def _resolve_competition_environment(search_roots: list[Path], temp_dir: Path) -> Tuple[Path, Path, Path, Path]:
     def find_robustly(name: str):
         for root in search_roots:
-            if not root.exists(): continue
+            if not root.exists():
+                continue
             try:
                 return find_kaggle_file(root, name)
             except FileNotFoundError:
@@ -221,27 +219,59 @@ def setup_kaggle_environment(config: Config) -> Tuple[Path, Path]:
     except FileNotFoundError:
         # If not, find and extract zip
         train_csv_zip = find_robustly('training_solutions_rev1.zip')
-        _extract_zip_if_needed(train_csv_zip, config.kaggle_temp_dir)
-        csv_path = find_kaggle_file(config.kaggle_temp_dir, 'training_solutions_rev1.csv')
+        _extract_zip_if_needed(train_csv_zip, temp_dir)
+        csv_path = find_kaggle_file(temp_dir, 'training_solutions_rev1.csv')
 
-    # Try to find image dir directly
+    # Try to find training image dir directly
     try:
-        # Check for a few jpgs to confirm it's the right dir
         image_dir_candidate = find_robustly('images_training_rev1')
         if not image_dir_candidate.is_dir():
-             # maybe it's the zip name, try to find a subfolder
-             raise FileNotFoundError
-        csv_path_check = list(Path(image_dir_candidate).glob('*.jpg'))
-        if len(csv_path_check) < 10:
-             raise FileNotFoundError
-        image_dir = image_dir_candidate
+            raise FileNotFoundError
+        train_check = list(Path(image_dir_candidate).glob('*.jpg'))
+        if len(train_check) < 10:
+            raise FileNotFoundError
+        train_image_dir = image_dir_candidate
     except FileNotFoundError:
-        # If not, find and extract zip
         image_zip = find_robustly('images_training_rev1.zip')
-        _extract_zip_if_needed(image_zip, config.kaggle_temp_dir)
-        image_dir = find_kaggle_file(config.kaggle_temp_dir, 'images_training_rev1')
+        _extract_zip_if_needed(image_zip, temp_dir)
+        train_image_dir = find_kaggle_file(temp_dir, 'images_training_rev1')
 
-    return Path(csv_path), Path(image_dir)
+    # Try to find test image dir directly
+    try:
+        test_dir_candidate = find_robustly('images_test_rev1')
+        if not test_dir_candidate.is_dir():
+            raise FileNotFoundError
+        test_check = list(Path(test_dir_candidate).glob('*.jpg'))
+        if len(test_check) < 10:
+            raise FileNotFoundError
+        test_image_dir = test_dir_candidate
+    except FileNotFoundError:
+        test_zip = find_robustly('images_test_rev1.zip')
+        _extract_zip_if_needed(test_zip, temp_dir)
+        test_image_dir = find_kaggle_file(temp_dir, 'images_test_rev1')
+
+    try:
+        submission_template_path = find_robustly('all_zeros_benchmark.zip')
+    except FileNotFoundError:
+        submission_template_path = find_robustly('all_zeros_benchmark.csv')
+
+    return (
+        Path(csv_path),
+        Path(train_image_dir),
+        Path(test_image_dir),
+        Path(submission_template_path),
+    )
+
+
+def setup_kaggle_environment(config: Config) -> Tuple[Path, Path, Path, Path]:
+    search_roots = [config.kaggle_input_dir, Path('/kaggle/input')]
+    return _resolve_competition_environment(search_roots, config.kaggle_temp_dir)
+
+
+def setup_local_environment(config: Config) -> Tuple[Path, Path, Path, Path]:
+    local_root = Path('galaxy_raw')
+    search_roots = [local_root]
+    return _resolve_competition_environment(search_roots, local_root)
 
 
 def save_json(path: Path, payload: dict) -> None:
@@ -572,6 +602,60 @@ class HierarchicalRMSELoss(tf.keras.losses.Loss):
 
 
 
+QUESTION_SLICES = (
+    (0, 3),
+    (3, 5),
+    (5, 7),
+    (7, 9),
+    (9, 13),
+    (13, 15),
+    (15, 18),
+    (18, 25),
+    (25, 28),
+    (28, 31),
+    (31, 37),
+)
+
+SCALING_SEQUENCE = (
+    (3, 5, 1),
+    (5, 13, 4),
+    (15, 18, 0),
+    (18, 25, 13),
+    (25, 28, 3),
+    (28, 37, 7),
+)
+
+
+def _rotate_batch(images: tf.Tensor, angle_degrees: float) -> tf.Tensor:
+    angle = tf.constant(angle_degrees * 3.141592653589793 / 180.0, dtype=tf.float32)
+    cos_a = tf.cos(angle)
+    sin_a = tf.sin(angle)
+    image_shape = tf.shape(images)
+    batch = image_shape[0]
+    h = tf.cast(image_shape[1], tf.float32)
+    w = tf.cast(image_shape[2], tf.float32)
+    cx = (w - 1.0) / 2.0
+    cy = (h - 1.0) / 2.0
+
+    a0 = cos_a
+    a1 = sin_a
+    a2 = cx - a0 * cx - a1 * cy
+    b0 = -sin_a
+    b1 = cos_a
+    b2 = cy - b0 * cx - b1 * cy
+    transform = tf.stack([a0, a1, a2, b0, b1, b2, 0.0, 0.0])
+    transforms = tf.tile(tf.reshape(transform, [1, 8]), [batch, 1])
+
+    return tf.raw_ops.ImageProjectiveTransformV3(
+        images=images,
+        transforms=transforms,
+        output_shape=image_shape[1:3],
+        fill_value=0.0,
+        interpolation='BILINEAR',
+        fill_mode='REFLECT',
+    )
+
+
 def _get_backbone(architecture: str, input_tensor: tf.Tensor) -> tf.keras.Model:
     """Instantiate a backbone model by architecture name with ImageNet weights."""
     arch_map = {
@@ -639,6 +723,115 @@ class MultiViewAverage(tf.keras.layers.Layer):
         batch = input_shape[0] // 8 if input_shape[0] is not None else None
         return (batch, input_shape[1])
 
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class BenannePartExtractor(tf.keras.layers.Layer):
+    """Create benanne-style views and 45x45 aligned parts."""
+    def __init__(self, view_size: int = 69, part_size: int = 45, **kwargs):
+        super().__init__(**kwargs)
+        self.view_size = view_size
+        self.part_size = part_size
+
+    def call(self, inputs):
+        regular_view = tf.image.resize(inputs, [self.view_size, self.view_size])
+        rotated_view = tf.image.resize(_rotate_batch(inputs, 45.0), [self.view_size, self.view_size])
+
+        views = [
+            regular_view,
+            tf.image.flip_left_right(regular_view),
+            rotated_view,
+            tf.image.flip_left_right(rotated_view),
+        ]
+
+        parts = []
+        ps = self.part_size
+        for view in views:
+            parts.append(view[:, :ps, :ps, :])
+            parts.append(tf.image.rot90(view[:, :ps, -ps:, :], k=1))
+            parts.append(tf.image.rot90(view[:, -ps:, -ps:, :], k=2))
+            parts.append(tf.image.rot90(view[:, -ps:, :ps, :], k=3))
+
+        return tf.concat(parts, axis=0)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"view_size": self.view_size, "part_size": self.part_size})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class PartFeatureMerge(tf.keras.layers.Layer):
+    """Merge flattened part features back into per-example features."""
+    def __init__(self, num_parts: int = 16, **kwargs):
+        super().__init__(**kwargs)
+        self.num_parts = num_parts
+
+    def call(self, inputs):
+        shape = tf.shape(inputs)
+        feature_dim = inputs.shape[-1]
+        merged = tf.reshape(inputs, [self.num_parts, shape[0] // self.num_parts, feature_dim])
+        merged = tf.transpose(merged, [1, 0, 2])
+        return tf.reshape(merged, [shape[0] // self.num_parts, self.num_parts * feature_dim])
+
+    def get_config(self):
+        config = super().get_config()
+        config["num_parts"] = self.num_parts
+        return config
+
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class MaxoutDense(tf.keras.layers.Layer):
+    """Dense layer with maxout pooling across linear pieces."""
+    def __init__(self, units: int, pieces: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.pieces = pieces
+        self.projection = tf.keras.layers.Dense(units * pieces, activation=None, dtype='float32')
+
+    def call(self, inputs):
+        outputs = self.projection(inputs)
+        dynamic_shape = tf.shape(outputs)
+        outputs = tf.reshape(outputs, [dynamic_shape[0], self.units, self.pieces])
+        return tf.reduce_max(outputs, axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"units": self.units, "pieces": self.pieces})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class GalaxyOutputLayer(tf.keras.layers.Layer):
+    """Normalizes per-question answers and applies Galaxy Zoo tree weights."""
+    def __init__(self, epsilon: float = 1e-7, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+    def call(self, inputs):
+        positive = tf.nn.softplus(inputs) + self.epsilon
+        question_probs = []
+        for start, end in QUESTION_SLICES:
+            question = positive[:, start:end]
+            question_sum = tf.reduce_sum(question, axis=1, keepdims=True)
+            question_probs.append(question / question_sum)
+
+        outputs = tf.concat(question_probs, axis=1)
+        for start, end, parent_idx in SCALING_SEQUENCE:
+            parent_prob = outputs[:, parent_idx:parent_idx + 1]
+            scaled_slice = outputs[:, start:end] * parent_prob
+            outputs = tf.concat(
+                [outputs[:, :start], scaled_slice, outputs[:, end:]],
+                axis=1,
+            )
+
+        return outputs
+
+    def get_config(self):
+        config = super().get_config()
+        config["epsilon"] = self.epsilon
+        return config
+
+
 def build_regression_model(
     architecture: str = 'EfficientNetV2B2',
     multi_view: bool = False,
@@ -649,18 +842,35 @@ def build_regression_model(
     """
     inputs = tf.keras.Input(shape=(None, None, 3), name='image_input')
 
+    if architecture == 'BenanneNetTF':
+        x = BenannePartExtractor(name='benanne_parts')(inputs)
+        x = tf.keras.layers.Conv2D(32, 6, activation='relu', padding='valid', name='conv1')(x)
+        x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool1')(x)
+        x = tf.keras.layers.Conv2D(64, 5, activation='relu', padding='valid', name='conv2')(x)
+        x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool2')(x)
+        x = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='valid', name='conv3')(x)
+        x = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='valid', name='conv4')(x)
+        x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool4')(x)
+        x = tf.keras.layers.Flatten(name='flatten_parts')(x)
+        x = PartFeatureMerge(name='merge_parts')(x)
+        x = tf.keras.layers.Dropout(0.5, name='dropout1')(x)
+        x = MaxoutDense(2048, pieces=2, name='maxout1')(x)
+        x = tf.keras.layers.Dropout(0.5, name='dropout2')(x)
+        x = MaxoutDense(2048, pieces=2, name='maxout2')(x)
+        x = tf.keras.layers.Dropout(0.5, name='dropout3')(x)
+        logits = tf.keras.layers.Dense(37, activation=None, dtype='float32', name='regression_logits')(x)
+        outputs = GalaxyOutputLayer(name='regression_output')(logits)
+        model = tf.keras.Model(inputs=inputs, outputs=outputs, name='GalaxyNet_BenanneNetTF')
+        return model, None
+
     x = inputs
     if multi_view:
         x = MultiViewLayer()(x)
 
-    # Get backbone with ImageNet weights
     base_model = _get_backbone(architecture, x)
-
-    # Process features
     x = tf.keras.layers.GlobalAveragePooling2D(name='gap')(base_model.output)
 
     if multi_view:
-        # Average features across the 8 views before the dense head
         x = MultiViewAverage()(x)
 
     x = tf.keras.layers.BatchNormalization(name='bn1')(x)
@@ -669,12 +879,12 @@ def build_regression_model(
     x = tf.keras.layers.Activation('gelu', name='gelu1')(x)
     x = tf.keras.layers.Dropout(0.4, name='dropout1')(x)
 
-    outputs = tf.keras.layers.Dense(
-        37, activation='sigmoid', dtype='float32', name='regression_output'
-    )(x)
+    logits = tf.keras.layers.Dense(37, activation=None, dtype='float32', name='regression_logits')(x)
+    outputs = GalaxyOutputLayer(name='regression_output')(logits)
 
     model = tf.keras.Model(
-        inputs=inputs, outputs=outputs,
+        inputs=inputs,
+        outputs=outputs,
         name=f'GalaxyNet_UnifiedRegression_{architecture}_MV' if multi_view else f'GalaxyNet_UnifiedRegression_{architecture}',
     )
     return model, base_model
@@ -686,6 +896,8 @@ def unfreeze_top_layers(base_model: tf.keras.Model, last_n: int) -> int:
     All layers before the last N are frozen (not trainable).
     Returns the number of unfrozen layers (those with trainable weights).
     """
+    if base_model is None:
+        return 0
     base_model.trainable = True
     total_layers = len(base_model.layers)
     freeze_up_to = max(0, total_layers - last_n)
@@ -701,7 +913,8 @@ def unfreeze_top_layers(base_model: tf.keras.Model, last_n: int) -> int:
 
 def freeze_base(base_model: tf.keras.Model) -> None:
     """Freeze all layers of the base model (for warmup phase)."""
-    base_model.trainable = False
+    if base_model is not None:
+        base_model.trainable = False
 
 
 # ============================================================
@@ -712,6 +925,11 @@ def freeze_base(base_model: tf.keras.Model) -> None:
 
 
 
+
+COLOUR_CHANNEL_WEIGHTS = tf.constant(
+    [-0.0148366, -0.01253134, -0.01040762],
+    dtype=tf.float32,
+)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -732,7 +950,7 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path) -> pd.DataFrame:
     # Check physical file existence to prune missing downloads
     df = df[df['image_path'].apply(lambda p: Path(p).exists())].copy()
 
-    keep_cols = ['image_path'] + target_cols
+    keep_cols = ['GalaxyID', 'image_path'] + target_cols
     return df[keep_cols], target_cols
 
 
@@ -859,62 +1077,92 @@ def apply_gaussian_blur(image: tf.Tensor, sigma: float = 1.0) -> tf.Tensor:
     return tf.squeeze(blurred, 0)
 
 
-def apply_continuous_rotation(image: tf.Tensor) -> tf.Tensor:
-    if tfa is not None:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        return tfa.image.rotate(image, angle, interpolation='BILINEAR')
-    else:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        cos_a = tf.cos(angle)
-        sin_a = tf.sin(angle)
-        h = tf.cast(tf.shape(image)[0], tf.float32)
-        w = tf.cast(tf.shape(image)[1], tf.float32)
-        cx, cy = w / 2.0, h / 2.0
-        a2 = cx - cx * cos_a - cy * sin_a
-        b2 = cy + cx * sin_a - cy * cos_a
-        transform = [cos_a, sin_a, a2, -sin_a, cos_a, b2, 0.0, 0.0]
-        transform = tf.cast(tf.stack(transform), tf.float32)
-        transform = tf.reshape(transform, [1, 8])
-        image_4d = tf.expand_dims(image, 0)
-        rotated = tf.raw_ops.ImageProjectiveTransformV3(
-            images=image_4d,
-            transforms=transform,
-            output_shape=tf.shape(image)[:2],
-            fill_value=0.0,
-            interpolation='BILINEAR',
-            fill_mode='REFLECT',
-        )
-        return tf.squeeze(rotated, 0)
+def apply_affine_transform(
+    image: tf.Tensor,
+    angle: tf.Tensor,
+    zoom: tf.Tensor = tf.constant(1.0, dtype=tf.float32),
+    translate_x: tf.Tensor = tf.constant(0.0, dtype=tf.float32),
+    translate_y: tf.Tensor = tf.constant(0.0, dtype=tf.float32),
+    flip_left_right: tf.Tensor = tf.constant(False),
+) -> tf.Tensor:
+    """Apply a deterministic affine transform in the style of benanne's pipeline."""
+    image = tf.cond(flip_left_right, lambda: tf.image.flip_left_right(image), lambda: image)
+
+    cos_a = tf.cos(angle) / zoom
+    sin_a = tf.sin(angle) / zoom
+    h = tf.cast(tf.shape(image)[0], tf.float32)
+    w = tf.cast(tf.shape(image)[1], tf.float32)
+    cx = (w - 1.0) / 2.0
+    cy = (h - 1.0) / 2.0
+
+    a0 = cos_a
+    a1 = sin_a
+    a2 = cx - a0 * cx - a1 * cy + translate_x
+    b0 = -sin_a
+    b1 = cos_a
+    b2 = cy - b0 * cx - b1 * cy + translate_y
+
+    transform = tf.reshape(tf.stack([a0, a1, a2, b0, b1, b2, 0.0, 0.0]), [1, 8])
+    image_4d = tf.expand_dims(image, 0)
+    transformed = tf.raw_ops.ImageProjectiveTransformV3(
+        images=image_4d,
+        transforms=tf.cast(transform, tf.float32),
+        output_shape=tf.shape(image)[:2],
+        fill_value=0.0,
+        interpolation='BILINEAR',
+        fill_mode='REFLECT',
+    )
+    return tf.squeeze(transformed, 0)
+
+
+def apply_colour_perturbation(image: tf.Tensor, std: float = 0.5) -> tf.Tensor:
+    image = image / 255.0
+    alpha = tf.random.normal([], stddev=std, dtype=tf.float32)
+    image = tf.clip_by_value(image + alpha * COLOUR_CHANNEL_WEIGHTS, 0.0, 1.0)
+    return image * 255.0
 
 
 def augment_image(image: tf.Tensor, label: tf.Tensor):
-    shape = tf.shape(image)
-    orig_h, orig_w = shape[0], shape[1]
+    h = tf.cast(tf.shape(image)[0], tf.float32)
+    w = tf.cast(tf.shape(image)[1], tf.float32)
+    scale_x = w / 424.0
+    scale_y = h / 424.0
 
-    image = apply_continuous_rotation(image)
-    image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_flip_up_down(image)
+    angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
+    log_zoom = tf.random.uniform([], math.log(1.0 / 1.3), math.log(1.3))
+    zoom = tf.exp(log_zoom)
+    translate_x = tf.random.uniform([], -4.0, 4.0) * scale_x
+    translate_y = tf.random.uniform([], -4.0, 4.0) * scale_y
+    flip_left_right = tf.random.uniform([]) > 0.5
 
-    if tf.random.uniform([]) < 0.3:
-        image = apply_poisson_noise(image, scale=25.0)
-
-    if tf.random.uniform([]) < 0.2:
-        sigma = tf.random.uniform([], 0.5, 2.0)
-        image = apply_gaussian_blur(image, sigma)
-
-    if tf.random.uniform([]) > 0.5:
-        image = tf.image.random_brightness(image, max_delta=0.15 * 255.0)
-        image = tf.image.random_contrast(image, lower=0.85, upper=1.15)
-
-    crop_h = tf.cast(tf.cast(orig_h, tf.float32) * 0.9, tf.int32)
-    crop_w = tf.cast(tf.cast(orig_w, tf.float32) * 0.9, tf.int32)
-    image = tf.image.random_crop(image, [crop_h, crop_w, 3])
-    image = tf.image.resize(image, [orig_h, orig_w])
-
-    if tf.random.uniform([]) > 0.7:
-        image = apply_cutout(image, n_holes=1, max_size_ratio=0.15)
-
+    image = apply_affine_transform(
+        image,
+        angle=angle,
+        zoom=zoom,
+        translate_x=translate_x,
+        translate_y=translate_y,
+        flip_left_right=flip_left_right,
+    )
+    image = apply_colour_perturbation(image, std=0.5)
     image = tf.clip_by_value(image, 0.0, 255.0)
+    return image, label
+
+
+def apply_tta_transform(image: tf.Tensor, label: tf.Tensor, tta_index: int):
+    """Apply deterministic benanne-style TTA: 10 rotations x 3 zooms x 2 flips."""
+    zooms = (1.0, 1.0 / 1.2, 1.2)
+    zoom_index = (tta_index // 20) % len(zooms)
+    transform_index = tta_index % 20
+    angle_index = transform_index // 2
+    flip_left_right = tf.equal(transform_index % 2, 1)
+    angle = tf.cast(angle_index, tf.float32) * (2.0 * math.pi / 10.0)
+
+    image = apply_affine_transform(
+        image,
+        angle=angle,
+        zoom=tf.constant(zooms[zoom_index], dtype=tf.float32),
+        flip_left_right=flip_left_right,
+    )
     return image, label
 
 
@@ -931,8 +1179,13 @@ def build_dataset(
     augment: bool = False,
     shuffle: bool = False,
     cache: bool = False,
+    drop_remainder: bool = False,
+    tta_index: int | None = None,
 ) -> tf.data.Dataset:
     """Build a tf.data.Dataset mapping paths and 37-node target vectors."""
+    if augment and tta_index is not None:
+        raise ValueError("Training augmentation and deterministic TTA are mutually exclusive.")
+
     ds = tf.data.Dataset.from_tensor_slices((image_paths, labels))
     ds = ds.map(
         lambda p, y: load_and_preprocess_image(p, y, image_size, center_crop_ratio),
@@ -945,10 +1198,16 @@ def build_dataset(
     if augment:
         ds = ds.map(lambda i, l: augment_image(i, l), num_parallel_calls=tf.data.AUTOTUNE)
 
+    if tta_index is not None:
+        ds = ds.map(
+            lambda i, l: apply_tta_transform(i, l, tta_index),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+
     if cache:
         ds = ds.cache()
 
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
@@ -957,22 +1216,35 @@ def build_dataset(
 # ══════════════════════════════════════════════════════════════
 
 def build_datasets(labels_df: pd.DataFrame, config: Config):
-    """Split data randomly for regression."""
-    train_df, temp_df = train_test_split(
-        labels_df,
-        test_size=config.val_split + config.test_split,
-        random_state=config.seed,
-    )
-    test_ratio_of_temp = config.test_split / (config.val_split + config.test_split)
-    val_df, test_df = train_test_split(
-        temp_df,
-        test_size=test_ratio_of_temp,
-        random_state=config.seed,
-    )
+    """Build train/validation/test splits for regression."""
+    if config.legacy_ordered_split:
+        ordered_df = labels_df.sort_values('GalaxyID').reset_index(drop=True)
+        train_fraction = 1.0 - config.val_split - config.test_split
+        train_end = int(len(ordered_df) * train_fraction)
+        val_end = int(len(ordered_df) * (1.0 - config.test_split))
+        train_df = ordered_df.iloc[:train_end].reset_index(drop=True)
+        val_df = ordered_df.iloc[train_end:val_end].reset_index(drop=True)
+        test_df = ordered_df.iloc[val_end:].reset_index(drop=True)
+    else:
+        train_df, temp_df = train_test_split(
+            labels_df,
+            test_size=config.val_split + config.test_split,
+            random_state=config.seed,
+        )
+        if config.test_split > 0:
+            test_ratio_of_temp = config.test_split / (config.val_split + config.test_split)
+            val_df, test_df = train_test_split(
+                temp_df,
+                test_size=test_ratio_of_temp,
+                random_state=config.seed,
+            )
+        else:
+            val_df = temp_df
+            test_df = temp_df.iloc[0:0].copy()
 
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
 
     split_info = {
         'train_size': len(train_df),
@@ -989,8 +1261,8 @@ def build_datasets(labels_df: pd.DataFrame, config: Config):
 # ============================================================
 
 
+import csv
 
-from tqdm import tqdm
 
 
 
@@ -998,6 +1270,25 @@ def calculate_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Calculate the global Root Mean Squared Error over all targets."""
     mse = np.mean(np.square(y_true - y_pred))
     return np.sqrt(mse)
+
+
+def load_inference_model(model_path: Path) -> tf.keras.Model:
+    custom_objects = {
+        'RMSELoss': RMSELoss,
+        'HierarchicalRMSELoss': HierarchicalRMSELoss,
+        'rmse_metric': rmse_metric,
+        'MultiViewLayer': MultiViewLayer,
+        'MultiViewAverage': MultiViewAverage,
+        'GalaxyOutputLayer': GalaxyOutputLayer,
+        'BenannePartExtractor': BenannePartExtractor,
+        'PartFeatureMerge': PartFeatureMerge,
+        'MaxoutDense': MaxoutDense,
+    }
+    return tf.keras.models.load_model(
+        model_path,
+        custom_objects=custom_objects,
+        compile=False,
+    )
 
 
 def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -> np.ndarray:
@@ -1013,6 +1304,7 @@ def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -
     ds_base = build_dataset(
         test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
         center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
+        drop_remainder=False, tta_index=0,
     )
     base_preds = model.predict(ds_base, verbose=1)
     tta_preds.append(base_preds)
@@ -1021,7 +1313,8 @@ def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -
     for i in range(config.tta_n_augments - 1):
         ds_aug = build_dataset(
             test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
-            center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=False,
+            center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
+            drop_remainder=False, tta_index=i + 1,
         )
         preds = model.predict(ds_aug, verbose=0)
         tta_preds.append(preds)
@@ -1030,7 +1323,72 @@ def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -
     return np.mean(tta_preds, axis=0)
 
 
-def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list[str]):
+def _load_submission_template(submission_template_path: Path) -> tuple[list[str], list[int]]:
+    if submission_template_path.suffix == '.zip':
+        with zipfile.ZipFile(submission_template_path, 'r') as zf:
+            csv_name = zf.namelist()[0]
+            with zf.open(csv_name, 'r') as handle:
+                lines = [line.decode('utf-8').strip() for line in handle]
+    else:
+        with submission_template_path.open('r', encoding='utf-8') as handle:
+            lines = [line.strip() for line in handle]
+
+    reader = csv.reader(lines)
+    rows = list(reader)
+    header = rows[0]
+    galaxy_ids = [int(row[0]) for row in rows[1:] if row]
+    return header, galaxy_ids
+
+
+def generate_competition_submission(
+    config: Config,
+    test_image_dir: Path,
+    target_cols: list[str],
+    submission_template_path: Path,
+) -> Path | None:
+    output_dir = config.output_dir
+    model_path = output_dir / 'unified_best.keras'
+    if not model_path.exists():
+        print(f"Error: Unified model not found at {model_path}")
+        return None
+
+    header, galaxy_ids = _load_submission_template(submission_template_path)
+    expected_header = ['GalaxyID'] + target_cols
+    if header != expected_header:
+        raise ValueError('Submission template header does not match expected competition columns.')
+
+    test_paths = np.array([str(test_image_dir / f'{galaxy_id}.jpg') for galaxy_id in galaxy_ids])
+    missing_paths = [path for path in test_paths if not Path(path).exists()]
+    if missing_paths:
+        raise FileNotFoundError(f'Missing {len(missing_paths)} competition test images.')
+
+    print('\n' + '=' * 60)
+    print('COMPETITION SUBMISSION')
+    print('=' * 60)
+    print(f'Predicting {len(test_paths)} competition test images...')
+
+    model = load_inference_model(model_path)
+    predictions = predict_tta(model, test_paths, config)
+    if predictions.shape != (len(galaxy_ids), len(target_cols)):
+        raise ValueError(
+            f'Unexpected prediction shape {predictions.shape}, expected {(len(galaxy_ids), len(target_cols))}.'
+        )
+
+    submission_df = pd.DataFrame(predictions, columns=target_cols)
+    submission_df.insert(0, 'GalaxyID', galaxy_ids)
+
+    submission_path = output_dir / config.submission_filename
+    submission_df.to_csv(
+        submission_path,
+        index=False,
+        compression='gzip',
+        float_format='%.6f',
+    )
+    print(f'Submission written to {submission_path}')
+    return submission_path
+
+
+def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list[str], split_name: str = 'test'):
     """Evaluate the single unified regression model using RMSE."""
     output_dir = config.output_dir
     model_path = output_dir / 'unified_best.keras'
@@ -1045,14 +1403,7 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
 
     # Load model
     print("Loading unified model...")
-    custom_objects = {
-        'RMSELoss': RMSELoss,
-        'HierarchicalRMSELoss': HierarchicalRMSELoss,
-        'rmse_metric': rmse_metric,
-        'MultiViewLayer': MultiViewLayer,
-        'MultiViewAverage': MultiViewAverage,
-    }
-    model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
+    model = load_inference_model(model_path)
 
     test_paths = test_df['image_path'].values
     y_true = test_df[target_cols].values.astype(np.float32)
@@ -1062,6 +1413,7 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
     ds_test = build_dataset(
         test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
         center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
+        drop_remainder=False,
     )
 
     print("\nRunning standard evaluation (1-pass)...")
@@ -1074,7 +1426,7 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
 
     # Report
     print('\n' + '-' * 40)
-    print("TEST METRICS (Kaggle Leaderboard Objective)")
+    print(f"{split_name.upper()} METRICS")
     print('-' * 40)
     print(f"  RMSE (Single Pass): {rmse_std:.5f}")
     print(f"  RMSE (TTA {config.tta_n_augments}x):     {rmse_tta:.5f}")
@@ -1082,7 +1434,8 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
 
     # Save results
     results = {
-        'test_size': len(test_df),
+        'split_name': split_name,
+        'split_size': len(test_df),
         'rmse_standard': float(rmse_std),
         'rmse_tta': float(rmse_tta),
     }
@@ -1099,6 +1452,12 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
 
 
 
+# Suppress noisy TF/Keras logs before importing TensorFlow.
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ABSL_LOGGING_LEVEL'] = 'error'
+
+
+tf.keras.utils.disable_interactive_logging()
 
 
 
@@ -1113,12 +1472,12 @@ class ConciseLogging(tf.keras.callbacks.Callback):
             # Handle standard variables or distributed MirroredVariables
             lr_val = float(tf.convert_to_tensor(lr))
 
-        print(f"Epoch {epoch+1:02d} | Loss: {logs.get('loss', 0):.5f} | "
-              f"Val RMSE: {logs.get('val_rmse_metric', 0):.5f} | LR: {lr_val:.2e}")
+        print(f"Epoch {epoch+1:02d} | Loss: {logs.get('loss', 0):.4f} | "
+              f"Val RMSE: {logs.get('val_rmse_metric', 0):.4f} | LR: {lr_val:.1e}")
 
 
 def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Path):
-    """Unified progressive resizing training loop for 37-node regression on TPU."""
+    """Unified progressive resizing training loop for 37-node regression."""
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1129,42 +1488,60 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     df, target_cols = generate_labels_df(solutions_csv, image_dir)
     split_info, (train_df, val_df, test_df) = build_datasets(df, config)
 
-    train_paths = train_df['image_path'].values[:100]
-    train_labels = train_df[target_cols].values[:100].astype(np.float32)
-    val_paths = val_df['image_path'].values[:20]
-    val_labels = val_df[target_cols].values[:20].astype(np.float32)
+    train_paths = train_df['image_path'].values
+    train_labels = train_df[target_cols].values.astype(np.float32)
+    val_paths = val_df['image_path'].values
+    val_labels = val_df[target_cols].values.astype(np.float32)
+    uses_benanne_schedule = config.architecture == 'BenanneNetTF'
 
     # Scale batch sizes by number of TPU replicas
     bs1 = config.get_scaled_batch_size(config.batch_size_phase1, strategy)
     bs2 = config.get_scaled_batch_size(config.batch_size_phase2, strategy)
     bs3 = config.get_scaled_batch_size(config.batch_size_phase3, strategy)
 
-    print(f"Global Batch Sizes (all cores): P1={bs1}, P2={bs2}, P3={bs3}")
 
     # ── Model & Strategy Scope ──
     with strategy.scope():
         model, base_model = build_regression_model(config.architecture, multi_view=config.multi_view)
-        loss_fn = HierarchicalRMSELoss()
+        loss_fn = RMSELoss()
+
+    def compile_for_phase(phase_lr: float, steps_per_epoch: int | None = None):
+        with strategy.scope():
+            if uses_benanne_schedule:
+                optimizer = tf.keras.optimizers.SGD(
+                    learning_rate=phase_lr,
+                    momentum=0.9,
+                    nesterov=True,
+                )
+            elif steps_per_epoch is None:
+                optimizer = tf.keras.optimizers.Adam(phase_lr)
+            else:
+                optimizer = tf.keras.optimizers.Adam(
+                    build_cosine_restart_schedule(
+                        phase_lr,
+                        steps_per_epoch,
+                        restart_epochs=5,
+                    ),
+                    clipnorm=1.0,
+                )
+            model.compile(optimizer=optimizer, loss=loss_fn, metrics=[rmse_metric])
+            return model
 
     # ── Phase 1: Warmup (Fixed layers, 128px) ──
-    print('\n[Phase 1] Warmup (Frozen Backbone, 128px)')
+    print(f'\n[Phase 1] Warmup (Frozen Backbone, {config.image_size_phase1}px)')
     freeze_base(base_model)
 
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase1, bs1,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
+        drop_remainder=True,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase1, bs1,
         center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
     )
 
-    with strategy.scope():
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(config.warmup_lr),
-            loss=loss_fn, metrics=[rmse_metric],
-        )
-        train_model = model
+    train_model = compile_for_phase(config.warmup_lr)
 
     train_model.fit(
         train_ds, validation_data=val_ds,
@@ -1174,28 +1551,24 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     )
 
     # ── Phase 2: Mid-tune (Partial unfreeze, 192px) ──
-    print(f'\n[Phase 2] Mid-tune (Unfreeze {config.unfreeze_phase2} layers, 192px)')
+    print(f'\n[Phase 2] Mid-tune (Unfreeze {config.unfreeze_phase2} layers, {config.image_size_phase2}px)')
     unfreeze_top_layers(base_model, config.unfreeze_phase2)
 
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase2, bs2,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
+        drop_remainder=True,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase2, bs2,
         center_crop_ratio=config.center_crop_ratio,
     )
 
-    with strategy.scope():
-        steps_per_epoch = len(train_paths) // bs2
-        lr_schedule = build_cosine_restart_schedule(
-            config.midtune_lr, steps_per_epoch, restart_epochs=5
-        )
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
-            loss=loss_fn, metrics=[rmse_metric],
-        )
-        train_model = model
+    steps_per_epoch = len(train_paths) // bs2
+    train_model = compile_for_phase(
+        config.midtune_lr,
+        None if uses_benanne_schedule else steps_per_epoch,
+    )
 
     train_model.fit(
         train_ds, validation_data=val_ds,
@@ -1211,22 +1584,18 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
+        drop_remainder=True,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio,
     )
 
-    with strategy.scope():
-        steps_per_epoch = len(train_paths) // bs3
-        lr_schedule_p3 = build_cosine_restart_schedule(
-            config.finetune_lr, steps_per_epoch, restart_epochs=5
-        )
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-            loss=loss_fn, metrics=[rmse_metric],
-        )
-        train_model = model
+    steps_per_epoch = len(train_paths) // bs3
+    train_model = compile_for_phase(
+        config.finetune_lr,
+        None if uses_benanne_schedule else steps_per_epoch,
+    )
 
     train_model.fit(
         train_ds, validation_data=val_ds,
@@ -1235,6 +1604,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
             tf.keras.callbacks.ModelCheckpoint(
                 str(output_dir / 'unified_best.keras'),
                 monitor='val_rmse_metric', save_best_only=True, mode='min',
+                verbose=0
             ),
             ConciseLogging(),
         ],
@@ -1242,13 +1612,16 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     )
 
     # ── SWA ──
-    print('\n[SWA Phase]')
-    train_ds_swa = build_dataset(
-        train_paths, train_labels, config.image_size_phase3, bs3,
-        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=True,
-    )
-    model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
-    model.save(str(output_dir / 'unified_best.keras'))
+    if config.swa_epochs > 0 and not uses_benanne_schedule:
+        print('\n[SWA Phase]')
+        train_ds_swa = build_dataset(
+            train_paths, train_labels, config.image_size_phase3, bs3,
+            center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=True,
+            drop_remainder=True,
+        )
+        with strategy.scope():
+            model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
+            model.save(str(output_dir / 'unified_best.keras'))
 
     # Save details
     save_json(output_dir / 'split_info.json', split_info)
@@ -1257,7 +1630,9 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     tf.keras.backend.clear_session()
     gc.collect()
 
-    return test_df, target_cols
+    eval_df = test_df if len(test_df) > 0 else val_df
+    eval_name = 'test' if len(test_df) > 0 else 'validation'
+    return eval_df, target_cols, eval_name
 
 
 def main():
@@ -1267,18 +1642,26 @@ def main():
     setup_environment(config)
 
     if is_kaggle_runtime():
-        solutions_csv, image_dir = setup_kaggle_environment(config)
+        solutions_csv, image_dir, test_image_dir, submission_template_path = setup_kaggle_environment(config)
     else:
-        solutions_csv = Path("galaxy_raw/training_solutions_rev1.csv")
-        image_dir = Path("galaxy_raw/training_images/images_training_rev1")
+        solutions_csv, image_dir, test_image_dir, submission_template_path = setup_local_environment(config)
 
     # Run pipeline
-    test_df, target_cols = train_unified_regression(config, solutions_csv, image_dir)
+    eval_df, target_cols, eval_name = train_unified_regression(config, solutions_csv, image_dir)
 
     print(f"\nTraining pipeline completed in {(time.time() - t0) / 60:.1f} minutes.")
 
-    # Run evaluation
-    evaluate_regression(config, test_df, target_cols)
+    evaluate_regression(config, eval_df, target_cols, split_name=eval_name)
+
+    if test_image_dir.exists():
+        from evaluate import generate_competition_submission
+
+        generate_competition_submission(
+            config=config,
+            test_image_dir=test_image_dir,
+            target_cols=target_cols,
+            submission_template_path=submission_template_path,
+        )
 
 
 if __name__ == '__main__':

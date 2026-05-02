@@ -15,6 +15,11 @@ try:
 except Exception:
     tfa = None
 
+COLOUR_CHANNEL_WEIGHTS = tf.constant(
+    [-0.0148366, -0.01253134, -0.01040762],
+    dtype=tf.float32,
+)
+
 
 # ══════════════════════════════════════════════════════════════
 # LABEL DETERMINATION (Regression - 37 Targets)
@@ -34,7 +39,7 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path) -> pd.DataFrame:
     # Check physical file existence to prune missing downloads
     df = df[df['image_path'].apply(lambda p: Path(p).exists())].copy()
     
-    keep_cols = ['image_path'] + target_cols
+    keep_cols = ['GalaxyID', 'image_path'] + target_cols
     return df[keep_cols], target_cols
 
 
@@ -161,62 +166,92 @@ def apply_gaussian_blur(image: tf.Tensor, sigma: float = 1.0) -> tf.Tensor:
     return tf.squeeze(blurred, 0)
 
 
-def apply_continuous_rotation(image: tf.Tensor) -> tf.Tensor:
-    if tfa is not None:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        return tfa.image.rotate(image, angle, interpolation='BILINEAR')
-    else:
-        angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
-        cos_a = tf.cos(angle)
-        sin_a = tf.sin(angle)
-        h = tf.cast(tf.shape(image)[0], tf.float32)
-        w = tf.cast(tf.shape(image)[1], tf.float32)
-        cx, cy = w / 2.0, h / 2.0
-        a2 = cx - cx * cos_a - cy * sin_a
-        b2 = cy + cx * sin_a - cy * cos_a
-        transform = [cos_a, sin_a, a2, -sin_a, cos_a, b2, 0.0, 0.0]
-        transform = tf.cast(tf.stack(transform), tf.float32)
-        transform = tf.reshape(transform, [1, 8])
-        image_4d = tf.expand_dims(image, 0)
-        rotated = tf.raw_ops.ImageProjectiveTransformV3(
-            images=image_4d,
-            transforms=transform,
-            output_shape=tf.shape(image)[:2],
-            fill_value=0.0,
-            interpolation='BILINEAR',
-            fill_mode='REFLECT',
-        )
-        return tf.squeeze(rotated, 0)
+def apply_affine_transform(
+    image: tf.Tensor,
+    angle: tf.Tensor,
+    zoom: tf.Tensor = tf.constant(1.0, dtype=tf.float32),
+    translate_x: tf.Tensor = tf.constant(0.0, dtype=tf.float32),
+    translate_y: tf.Tensor = tf.constant(0.0, dtype=tf.float32),
+    flip_left_right: tf.Tensor = tf.constant(False),
+) -> tf.Tensor:
+    """Apply a deterministic affine transform in the style of benanne's pipeline."""
+    image = tf.cond(flip_left_right, lambda: tf.image.flip_left_right(image), lambda: image)
+
+    cos_a = tf.cos(angle) / zoom
+    sin_a = tf.sin(angle) / zoom
+    h = tf.cast(tf.shape(image)[0], tf.float32)
+    w = tf.cast(tf.shape(image)[1], tf.float32)
+    cx = (w - 1.0) / 2.0
+    cy = (h - 1.0) / 2.0
+
+    a0 = cos_a
+    a1 = sin_a
+    a2 = cx - a0 * cx - a1 * cy + translate_x
+    b0 = -sin_a
+    b1 = cos_a
+    b2 = cy - b0 * cx - b1 * cy + translate_y
+
+    transform = tf.reshape(tf.stack([a0, a1, a2, b0, b1, b2, 0.0, 0.0]), [1, 8])
+    image_4d = tf.expand_dims(image, 0)
+    transformed = tf.raw_ops.ImageProjectiveTransformV3(
+        images=image_4d,
+        transforms=tf.cast(transform, tf.float32),
+        output_shape=tf.shape(image)[:2],
+        fill_value=0.0,
+        interpolation='BILINEAR',
+        fill_mode='REFLECT',
+    )
+    return tf.squeeze(transformed, 0)
+
+
+def apply_colour_perturbation(image: tf.Tensor, std: float = 0.5) -> tf.Tensor:
+    image = image / 255.0
+    alpha = tf.random.normal([], stddev=std, dtype=tf.float32)
+    image = tf.clip_by_value(image + alpha * COLOUR_CHANNEL_WEIGHTS, 0.0, 1.0)
+    return image * 255.0
 
 
 def augment_image(image: tf.Tensor, label: tf.Tensor):
-    shape = tf.shape(image)
-    orig_h, orig_w = shape[0], shape[1]
+    h = tf.cast(tf.shape(image)[0], tf.float32)
+    w = tf.cast(tf.shape(image)[1], tf.float32)
+    scale_x = w / 424.0
+    scale_y = h / 424.0
 
-    image = apply_continuous_rotation(image)
-    image = tf.image.random_flip_left_right(image)
-    image = tf.image.random_flip_up_down(image)
+    angle = tf.random.uniform([], 0.0, 2.0 * math.pi)
+    log_zoom = tf.random.uniform([], math.log(1.0 / 1.3), math.log(1.3))
+    zoom = tf.exp(log_zoom)
+    translate_x = tf.random.uniform([], -4.0, 4.0) * scale_x
+    translate_y = tf.random.uniform([], -4.0, 4.0) * scale_y
+    flip_left_right = tf.random.uniform([]) > 0.5
 
-    if tf.random.uniform([]) < 0.3:
-        image = apply_poisson_noise(image, scale=25.0)
-
-    if tf.random.uniform([]) < 0.2:
-        sigma = tf.random.uniform([], 0.5, 2.0)
-        image = apply_gaussian_blur(image, sigma)
-
-    if tf.random.uniform([]) > 0.5:
-        image = tf.image.random_brightness(image, max_delta=0.15 * 255.0)
-        image = tf.image.random_contrast(image, lower=0.85, upper=1.15)
-
-    crop_h = tf.cast(tf.cast(orig_h, tf.float32) * 0.9, tf.int32)
-    crop_w = tf.cast(tf.cast(orig_w, tf.float32) * 0.9, tf.int32)
-    image = tf.image.random_crop(image, [crop_h, crop_w, 3])
-    image = tf.image.resize(image, [orig_h, orig_w])
-
-    if tf.random.uniform([]) > 0.7:
-        image = apply_cutout(image, n_holes=1, max_size_ratio=0.15)
-
+    image = apply_affine_transform(
+        image,
+        angle=angle,
+        zoom=zoom,
+        translate_x=translate_x,
+        translate_y=translate_y,
+        flip_left_right=flip_left_right,
+    )
+    image = apply_colour_perturbation(image, std=0.5)
     image = tf.clip_by_value(image, 0.0, 255.0)
+    return image, label
+
+
+def apply_tta_transform(image: tf.Tensor, label: tf.Tensor, tta_index: int):
+    """Apply deterministic benanne-style TTA: 10 rotations x 3 zooms x 2 flips."""
+    zooms = (1.0, 1.0 / 1.2, 1.2)
+    zoom_index = (tta_index // 20) % len(zooms)
+    transform_index = tta_index % 20
+    angle_index = transform_index // 2
+    flip_left_right = tf.equal(transform_index % 2, 1)
+    angle = tf.cast(angle_index, tf.float32) * (2.0 * math.pi / 10.0)
+
+    image = apply_affine_transform(
+        image,
+        angle=angle,
+        zoom=tf.constant(zooms[zoom_index], dtype=tf.float32),
+        flip_left_right=flip_left_right,
+    )
     return image, label
 
 
@@ -233,8 +268,13 @@ def build_dataset(
     augment: bool = False,
     shuffle: bool = False,
     cache: bool = False,
+    drop_remainder: bool = False,
+    tta_index: int | None = None,
 ) -> tf.data.Dataset:
     """Build a tf.data.Dataset mapping paths and 37-node target vectors."""
+    if augment and tta_index is not None:
+        raise ValueError("Training augmentation and deterministic TTA are mutually exclusive.")
+
     ds = tf.data.Dataset.from_tensor_slices((image_paths, labels))
     ds = ds.map(
         lambda p, y: load_and_preprocess_image(p, y, image_size, center_crop_ratio),
@@ -247,10 +287,16 @@ def build_dataset(
     if augment:
         ds = ds.map(lambda i, l: augment_image(i, l), num_parallel_calls=tf.data.AUTOTUNE)
 
+    if tta_index is not None:
+        ds = ds.map(
+            lambda i, l: apply_tta_transform(i, l, tta_index),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+
     if cache:
         ds = ds.cache()
 
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
@@ -259,22 +305,35 @@ def build_dataset(
 # ══════════════════════════════════════════════════════════════
 
 def build_datasets(labels_df: pd.DataFrame, config: Config):
-    """Split data randomly for regression."""
-    train_df, temp_df = train_test_split(
-        labels_df,
-        test_size=config.val_split + config.test_split,
-        random_state=config.seed,
-    )
-    test_ratio_of_temp = config.test_split / (config.val_split + config.test_split)
-    val_df, test_df = train_test_split(
-        temp_df,
-        test_size=test_ratio_of_temp,
-        random_state=config.seed,
-    )
-    
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
+    """Build train/validation/test splits for regression."""
+    if config.legacy_ordered_split:
+        ordered_df = labels_df.sort_values('GalaxyID').reset_index(drop=True)
+        train_fraction = 1.0 - config.val_split - config.test_split
+        train_end = int(len(ordered_df) * train_fraction)
+        val_end = int(len(ordered_df) * (1.0 - config.test_split))
+        train_df = ordered_df.iloc[:train_end].reset_index(drop=True)
+        val_df = ordered_df.iloc[train_end:val_end].reset_index(drop=True)
+        test_df = ordered_df.iloc[val_end:].reset_index(drop=True)
+    else:
+        train_df, temp_df = train_test_split(
+            labels_df,
+            test_size=config.val_split + config.test_split,
+            random_state=config.seed,
+        )
+        if config.test_split > 0:
+            test_ratio_of_temp = config.test_split / (config.val_split + config.test_split)
+            val_df, test_df = train_test_split(
+                temp_df,
+                test_size=test_ratio_of_temp,
+                random_state=config.seed,
+            )
+        else:
+            val_df = temp_df
+            test_df = temp_df.iloc[0:0].copy()
+
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
 
     split_info = {
         'train_size': len(train_df),
