@@ -51,6 +51,15 @@ def get_strategy() -> tf.distribute.Strategy:
 def setup_environment(config: Config) -> None:
     set_global_seed(config.seed)
 
+    # Configure GPU memory growth FIRST (before any GPU initialization)
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(f"Warning: Could not set GPU memory growth: {e}")
+
     if config.enable_mixed_precision:
         # Determine policy based on ACTUAL hardware presence
         # TPU v3/v5 prefers bfloat16, GPU prefers float16
@@ -58,11 +67,6 @@ def setup_environment(config: Config) -> None:
         
         policy = 'mixed_bfloat16' if is_tpu else 'mixed_float16'
         tf.keras.mixed_precision.set_global_policy(policy)
-
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
     
     # Final check for visibility
     if not any(os.environ.get(k) for k in ['TPU_NAME', 'KAGGLE_TPU_ADDR']) and not gpus:

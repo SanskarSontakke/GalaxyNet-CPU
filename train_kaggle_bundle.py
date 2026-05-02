@@ -171,6 +171,15 @@ def get_strategy() -> tf.distribute.Strategy:
 def setup_environment(config: Config) -> None:
     set_global_seed(config.seed)
 
+    # Configure GPU memory growth FIRST (before any GPU initialization)
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(f"Warning: Could not set GPU memory growth: {e}")
+
     if config.enable_mixed_precision:
         # Determine policy based on ACTUAL hardware presence
         # TPU v3/v5 prefers bfloat16, GPU prefers float16
@@ -178,11 +187,6 @@ def setup_environment(config: Config) -> None:
 
         policy = 'mixed_bfloat16' if is_tpu else 'mixed_float16'
         tf.keras.mixed_precision.set_global_policy(policy)
-
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
 
     # Final check for visibility
     if not any(os.environ.get(k) for k in ['TPU_NAME', 'KAGGLE_TPU_ADDR']) and not gpus:
@@ -519,6 +523,9 @@ def run_swa(
 @tf.keras.utils.register_keras_serializable(package="Custom")
 def rmse_metric(y_true, y_pred):
     """Root Mean Squared Error for the 37 regression targets."""
+    # Cast to float32 to ensure compatibility with mixed precision
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
     mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
     return tf.maximum(0.0, tf.sqrt(mse))
 
@@ -533,6 +540,9 @@ class RMSELoss(tf.keras.losses.Loss):
         super().__init__(name=name, **kwargs)
 
     def call(self, y_true, y_pred):
+        # Cast to float32 to ensure compatibility with mixed precision
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
         # Calculate MSE across the 37 features
         mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
         # Apply sqrt with epsilon to prevent infinite gradient at exactly 0.0 variance
@@ -565,6 +575,10 @@ class HierarchicalRMSELoss(tf.keras.losses.Loss):
         # We apply the scaling to the predictions to match the hierarchy
         # However, the ground truth targets are already weighted in the dataset.
         # So we just calculate RMSE on the raw targets vs our hierarchical predictions.
+        # Cast to float32 to ensure compatibility with mixed precision
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+
         y_pred_h = self._apply_hierarchy(y_pred)
 
         mse = tf.reduce_mean(tf.square(y_true - y_pred_h), axis=-1)

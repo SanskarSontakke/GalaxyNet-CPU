@@ -3,6 +3,9 @@ import tensorflow as tf
 @tf.keras.utils.register_keras_serializable(package="Custom")
 def rmse_metric(y_true, y_pred):
     """Root Mean Squared Error for the 37 regression targets."""
+    # Cast to float32 to ensure compatibility with mixed precision
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
     mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
     return tf.maximum(0.0, tf.sqrt(mse))
 
@@ -17,6 +20,9 @@ class RMSELoss(tf.keras.losses.Loss):
         super().__init__(name=name, **kwargs)
 
     def call(self, y_true, y_pred):
+        # Cast to float32 to ensure compatibility with mixed precision
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
         # Calculate MSE across the 37 features
         mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
         # Apply sqrt with epsilon to prevent infinite gradient at exactly 0.0 variance
@@ -49,6 +55,10 @@ class HierarchicalRMSELoss(tf.keras.losses.Loss):
         # We apply the scaling to the predictions to match the hierarchy
         # However, the ground truth targets are already weighted in the dataset.
         # So we just calculate RMSE on the raw targets vs our hierarchical predictions.
+        # Cast to float32 to ensure compatibility with mixed precision
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        
         y_pred_h = self._apply_hierarchy(y_pred)
         
         mse = tf.reduce_mean(tf.square(y_true - y_pred_h), axis=-1)
