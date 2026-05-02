@@ -19,19 +19,55 @@ def set_global_seed(seed: int) -> None:
     tf.random.set_seed(seed)
 
 
+def get_strategy() -> tf.distribute.Strategy:
+    """Detect and initialize the appropriate distribution strategy."""
+    try:
+        # Standard TPU detection
+        tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(tpu)
+        tf.tpu.experimental.initialize_tpu_system(tpu)
+        strategy = tf.distribute.TPUStrategy(tpu)
+        print(f"Running on TPU (Standard): {tpu.cluster_spec().as_dict()}")
+        return strategy
+    except (ValueError, RuntimeError, tf.errors.NotFoundError):
+        try:
+            # Fallback for some Kaggle environments (TPU v5 or newer)
+            tpu = tf.distribute.cluster_resolver.TPUClusterResolver(tpu='local')
+            tf.config.experimental_connect_to_cluster(tpu)
+            tf.tpu.experimental.initialize_tpu_system(tpu)
+            strategy = tf.distribute.TPUStrategy(tpu)
+            print("Running on TPU (Local Resolver)")
+            return strategy
+        except (ValueError, RuntimeError, tf.errors.NotFoundError):
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                print(f"Running on GPU: {len(gpus)} device(s)")
+                return tf.distribute.MirroredStrategy()
+            else:
+                print("Running on CPU")
+                return tf.distribute.get_strategy()
+
+
 def setup_environment(config: Config) -> None:
     set_global_seed(config.seed)
 
     if config.enable_mixed_precision:
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        # Determine policy based on ACTUAL hardware presence
+        # TPU v3/v5 prefers bfloat16, GPU prefers float16
+        is_tpu = any(os.environ.get(k) for k in ['TPU_NAME', 'KAGGLE_TPU_ADDR', 'COLAB_TPU_ADDR'])
+        
+        policy = 'mixed_bfloat16' if is_tpu else 'mixed_float16'
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print(f"Hardware-aware mixed precision policy set to: {policy}")
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
-        print(f'GPU available: {gpus}')
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-    else:
-        print('No GPU detected — running on CPU')
+    
+    # Final check for visibility
+    if not any(os.environ.get(k) for k in ['TPU_NAME', 'KAGGLE_TPU_ADDR']) and not gpus:
+        print('Warning: No Hardware Accelerator (GPU/TPU) detected — running on CPU')
 
 
 def find_kaggle_file(root: Path, name: str) -> Path:
@@ -48,18 +84,43 @@ def _extract_zip_if_needed(zip_path: Path, output_dir: Path) -> None:
 
 
 def setup_kaggle_environment(config: Config) -> Tuple[Path, Path]:
-    train_csv_zip = find_kaggle_file(config.kaggle_input_dir, 'training_solutions_rev1.zip')
-    image_zip = find_kaggle_file(config.kaggle_input_dir, 'images_training_rev1.zip')
+    # Look for files more broadly if not found in specific path
+    search_roots = [config.kaggle_input_dir, Path('/kaggle/input')]
+    
+    def find_robustly(name: str):
+        for root in search_roots:
+            if not root.exists(): continue
+            try:
+                return find_kaggle_file(root, name)
+            except FileNotFoundError:
+                continue
+        raise FileNotFoundError(f"Could not find {name} in any of {search_roots}")
 
-    _extract_zip_if_needed(train_csv_zip, config.kaggle_temp_dir)
-    _extract_zip_if_needed(image_zip, config.kaggle_temp_dir)
+    # Try to find CSV directly first (if already unzipped)
+    try:
+        csv_path = find_robustly('training_solutions_rev1.csv')
+    except FileNotFoundError:
+        # If not, find and extract zip
+        train_csv_zip = find_robustly('training_solutions_rev1.zip')
+        _extract_zip_if_needed(train_csv_zip, config.kaggle_temp_dir)
+        csv_path = find_kaggle_file(config.kaggle_temp_dir, 'training_solutions_rev1.csv')
 
-    csv_path = find_kaggle_file(config.kaggle_temp_dir, 'training_solutions_rev1.csv')
-    image_dir = find_kaggle_file(config.kaggle_temp_dir, 'images_training_rev1')
-
-    jpg_count = len(list(Path(image_dir).glob('*.jpg')))
-    if jpg_count < 1000:
-        raise RuntimeError(f'Expected >=1000 jpg files, found {jpg_count} in {image_dir}')
+    # Try to find image dir directly
+    try:
+        # Check for a few jpgs to confirm it's the right dir
+        image_dir_candidate = find_robustly('images_training_rev1')
+        if not image_dir_candidate.is_dir():
+             # maybe it's the zip name, try to find a subfolder
+             raise FileNotFoundError
+        csv_path_check = list(Path(image_dir_candidate).glob('*.jpg'))
+        if len(csv_path_check) < 10:
+             raise FileNotFoundError
+        image_dir = image_dir_candidate
+    except FileNotFoundError:
+        # If not, find and extract zip
+        image_zip = find_robustly('images_training_rev1.zip')
+        _extract_zip_if_needed(image_zip, config.kaggle_temp_dir)
+        image_dir = find_kaggle_file(config.kaggle_temp_dir, 'images_training_rev1')
 
     return Path(csv_path), Path(image_dir)
 
@@ -78,6 +139,7 @@ def is_kaggle_runtime() -> bool:
 # V25 — GRADIENT ACCUMULATION HELPER
 # ══════════════════════════════════════════════════════════════
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
 class GradientAccumulationModel(tf.keras.Model):
     """Wrapper model that accumulates gradients over N mini-batches
     before applying an optimizer step. This allows effective large
@@ -95,6 +157,14 @@ class GradientAccumulationModel(tf.keras.Model):
         self.accumulation_steps = accumulation_steps
         self.step_count = tf.Variable(0, trainable=False, dtype=tf.int32)
         self._accum_gradients = None
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "inner_model": self.inner_model,
+            "accumulation_steps": self.accumulation_steps,
+        })
+        return config
 
     def call(self, inputs, training=False):
         return self.inner_model(inputs, training=training)

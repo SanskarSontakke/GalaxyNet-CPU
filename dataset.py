@@ -42,13 +42,47 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path) -> pd.DataFrame:
 # IMAGE LOADING & BASE PREPROCESSING
 # ══════════════════════════════════════════════════════════════
 
-def _center_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
-    h = tf.shape(image)[0]
-    w = tf.shape(image)[1]
-    ch = tf.cast(tf.cast(h, tf.float32) * ratio, tf.int32)
-    cw = tf.cast(tf.cast(w, tf.float32) * ratio, tf.int32)
-    offset_h = (h - ch) // 2
-    offset_w = (w - cw) // 2
+def _smart_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
+    """Crops the image around its brightness centroid instead of the static center.
+    
+    Uses a Gaussian center prior to avoid latching onto background stars.
+    """
+    shape = tf.shape(image)
+    h_int, w_int = shape[0], shape[1]
+    h, w = tf.cast(h_int, tf.float32), tf.cast(w_int, tf.float32)
+    
+    # Calculate centroid using green channel (brightness approximation)
+    img_green = image[..., 1]
+    
+    # Apply Gaussian center prior (sigma^2 = 5000 as in benanne solution)
+    yy_grid, xx_grid = tf.meshgrid(tf.range(h_int), tf.range(w_int), indexing='ij')
+    yy_grid = tf.cast(yy_grid, tf.float32)
+    xx_grid = tf.cast(xx_grid, tf.float32)
+    
+    prior = tf.exp(-((yy_grid - h/2.0)**2 + (xx_grid - w/2.0)**2) / 5000.0)
+    img_weighted = img_green * prior
+    
+    total_flux = tf.reduce_sum(img_weighted) + 1e-6
+    
+    # Weighted average coordinates
+    cy = tf.reduce_sum(tf.reduce_sum(img_weighted, axis=1) * tf.cast(tf.range(h_int), tf.float32)) / total_flux
+    cx = tf.reduce_sum(tf.reduce_sum(img_weighted, axis=0) * tf.cast(tf.range(w_int), tf.float32)) / total_flux
+    
+    # Clip centroid to keep the crop mostly within image bounds
+    cy = tf.clip_by_value(cy, h * 0.1, h * 0.9)
+    cx = tf.clip_by_value(cx, w * 0.1, w * 0.9)
+    
+    # Crop size
+    ch = tf.cast(h * ratio, tf.int32)
+    cw = tf.cast(w * ratio, tf.int32)
+    
+    offset_h = tf.cast(cy - tf.cast(ch, tf.float32) / 2.0, tf.int32)
+    offset_w = tf.cast(cx - tf.cast(cw, tf.float32) / 2.0, tf.int32)
+    
+    # Final clamping to ensure valid crop
+    offset_h = tf.clip_by_value(offset_h, 0, h_int - ch)
+    offset_w = tf.clip_by_value(offset_w, 0, w_int - cw)
+    
     return tf.image.crop_to_bounding_box(image, offset_h, offset_w, ch, cw)
 
 
@@ -57,7 +91,7 @@ def load_and_preprocess_image(path: tf.Tensor, label: tf.Tensor, image_size: int
     img = tf.io.read_file(path)
     img = tf.image.decode_jpeg(img, channels=3)
     img = tf.cast(img, tf.float32)
-    img = _center_crop(img, ratio=center_crop_ratio)
+    img = _smart_crop(img, ratio=center_crop_ratio)
     img = tf.image.resize(img, [image_size, image_size])
     img = tf.clip_by_value(img, 0.0, 255.0)
     return img, label

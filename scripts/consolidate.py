@@ -8,7 +8,6 @@ MODULES = [
     'losses.py',
     'model.py',
     'dataset.py',
-    'stacking.py',
     'evaluate.py',
     'train.py',
 ]
@@ -16,7 +15,7 @@ MODULES = [
 OUTPUT_FILE = 'train_kaggle_bundle.py'
 
 # Modules whose imports are consolidated into the header
-LOCAL_MODULES = {'config', 'utils', 'losses', 'model', 'dataset', 'stacking', 'evaluate', 'train'}
+LOCAL_MODULES = {'config', 'utils', 'losses', 'model', 'dataset', 'evaluate', 'train'}
 
 HEADER_MODULES = {
     'argparse', 'datetime', 'gc', 'json', 'math', 'multiprocessing',

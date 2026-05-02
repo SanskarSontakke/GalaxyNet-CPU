@@ -59,41 +59,42 @@ except ImportError:
 @dataclass
 class Config:
     # ── Paths ──────────────────────────────────────────────────
-    kaggle_input_dir: Path = Path('/kaggle/input/competitions/galaxy-zoo-the-galaxy-challenge')
+    kaggle_input_dir: Path = Path('/kaggle/input/galaxy-zoo-the-galaxy-challenge')
     kaggle_temp_dir: Path = Path('/kaggle/temp')
     output_dir: Path = Path('/kaggle/working/outputs')
 
     # ── Image resolution curriculum ────────────────────────────
     image_size_phase1: int = 128
     image_size_phase2: int = 192
-    image_size_phase3: int = 288
+    image_size_phase3: int = 384
     center_crop_ratio: float = 0.75
 
-    # ── Batch sizes (per phase, tuned for P100 16GB) ───────────
-    batch_size_phase1: int = 64
-    batch_size_phase2: int = 32
-    batch_size_phase3: int = 16
-    grad_accumulation_steps: int = 1  # Native batching to avoid tf.Variable placement errors
+    # ── Batch sizes (BASE per device) ──────────────────────────
+    batch_size_phase1: int = 16
+    batch_size_phase2: int = 8
+    batch_size_phase3: int = 4
+    grad_accumulation_steps: int = 1
 
     # ── Data split ─────────────────────────────────────────────
     seed: int = 42
     val_split: float = 0.15
-    test_split: float = 0.15
+    test_split: float = 0.10
 
     # ── Model Architecture ─────────────────────────────────────
     architecture: str = 'EfficientNetV2B2'
+    multi_view: bool = True
 
-    # ── Training Schedule ──────────────────────────────────────
-    warmup_epochs: int = 12
-    midtune_epochs: int = 10
-    finetune_epochs: int = 25
+    # ── Training Schedule (MINIMUM FOR TESTING) ────────────────
+    warmup_epochs: int = 1
+    midtune_epochs: int = 1
+    finetune_epochs: int = 1
 
-    warmup_lr: float = 3e-4
-    midtune_lr: float = 3e-5
-    finetune_lr: float = 8e-6
+    warmup_lr: float = 2e-4
+    midtune_lr: float = 2e-5
+    finetune_lr: float = 5e-6
 
     unfreeze_phase2: int = 50
-    unfreeze_phase3: int = 80
+    unfreeze_phase3: int = 100
 
     # ── Augmentation ───────────────────────────────────────────
     mixup_alpha: float = 0.4
@@ -102,21 +103,24 @@ class Config:
     cutout_max_size_ratio: float = 0.20
 
     # ── Astronomy-Specific Augmentations (V26) ─────────────────
-    augment_poisson_scale: float = 25.0   # higher = less noise
+    augment_poisson_scale: float = 25.0
     augment_poisson_prob: float = 0.3
     augment_blur_prob: float = 0.2
     augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)
 
     # ── SWA ────────────────────────────────────────────────────
-    swa_epochs: int = 5
+    swa_epochs: int = 1  # Minimum
     swa_lr_high: float = 1e-5
-    swa_lr_low: float = 5e-6
+    swa_lr_low: float = 2e-6
 
     # ── TTA ────────────────────────────────────────────────────
-    tta_n_augments: int = 16
+    tta_n_augments: int = 2 # Minimum
 
     # ── Runtime ────────────────────────────────────────────────
     enable_mixed_precision: bool = True
+
+    def get_scaled_batch_size(self, base_size: int, strategy: tf.distribute.Strategy) -> int:
+        return base_size * strategy.num_replicas_in_sync
 
 
 # ============================================================
@@ -134,19 +138,55 @@ def set_global_seed(seed: int) -> None:
     tf.random.set_seed(seed)
 
 
+def get_strategy() -> tf.distribute.Strategy:
+    """Detect and initialize the appropriate distribution strategy."""
+    try:
+        # Standard TPU detection
+        tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(tpu)
+        tf.tpu.experimental.initialize_tpu_system(tpu)
+        strategy = tf.distribute.TPUStrategy(tpu)
+        print(f"Running on TPU (Standard): {tpu.cluster_spec().as_dict()}")
+        return strategy
+    except (ValueError, RuntimeError, tf.errors.NotFoundError):
+        try:
+            # Fallback for some Kaggle environments (TPU v5 or newer)
+            tpu = tf.distribute.cluster_resolver.TPUClusterResolver(tpu='local')
+            tf.config.experimental_connect_to_cluster(tpu)
+            tf.tpu.experimental.initialize_tpu_system(tpu)
+            strategy = tf.distribute.TPUStrategy(tpu)
+            print("Running on TPU (Local Resolver)")
+            return strategy
+        except (ValueError, RuntimeError, tf.errors.NotFoundError):
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                print(f"Running on GPU: {len(gpus)} device(s)")
+                return tf.distribute.MirroredStrategy()
+            else:
+                print("Running on CPU")
+                return tf.distribute.get_strategy()
+
+
 def setup_environment(config: Config) -> None:
     set_global_seed(config.seed)
 
     if config.enable_mixed_precision:
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+        # Determine policy based on ACTUAL hardware presence
+        # TPU v3/v5 prefers bfloat16, GPU prefers float16
+        is_tpu = any(os.environ.get(k) for k in ['TPU_NAME', 'KAGGLE_TPU_ADDR', 'COLAB_TPU_ADDR'])
+
+        policy = 'mixed_bfloat16' if is_tpu else 'mixed_float16'
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print(f"Hardware-aware mixed precision policy set to: {policy}")
 
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
-        print(f'GPU available: {gpus}')
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-    else:
-        print('No GPU detected — running on CPU')
+
+    # Final check for visibility
+    if not any(os.environ.get(k) for k in ['TPU_NAME', 'KAGGLE_TPU_ADDR']) and not gpus:
+        print('Warning: No Hardware Accelerator (GPU/TPU) detected — running on CPU')
 
 
 def find_kaggle_file(root: Path, name: str) -> Path:
@@ -163,18 +203,43 @@ def _extract_zip_if_needed(zip_path: Path, output_dir: Path) -> None:
 
 
 def setup_kaggle_environment(config: Config) -> Tuple[Path, Path]:
-    train_csv_zip = find_kaggle_file(config.kaggle_input_dir, 'training_solutions_rev1.zip')
-    image_zip = find_kaggle_file(config.kaggle_input_dir, 'images_training_rev1.zip')
+    # Look for files more broadly if not found in specific path
+    search_roots = [config.kaggle_input_dir, Path('/kaggle/input')]
 
-    _extract_zip_if_needed(train_csv_zip, config.kaggle_temp_dir)
-    _extract_zip_if_needed(image_zip, config.kaggle_temp_dir)
+    def find_robustly(name: str):
+        for root in search_roots:
+            if not root.exists(): continue
+            try:
+                return find_kaggle_file(root, name)
+            except FileNotFoundError:
+                continue
+        raise FileNotFoundError(f"Could not find {name} in any of {search_roots}")
 
-    csv_path = find_kaggle_file(config.kaggle_temp_dir, 'training_solutions_rev1.csv')
-    image_dir = find_kaggle_file(config.kaggle_temp_dir, 'images_training_rev1')
+    # Try to find CSV directly first (if already unzipped)
+    try:
+        csv_path = find_robustly('training_solutions_rev1.csv')
+    except FileNotFoundError:
+        # If not, find and extract zip
+        train_csv_zip = find_robustly('training_solutions_rev1.zip')
+        _extract_zip_if_needed(train_csv_zip, config.kaggle_temp_dir)
+        csv_path = find_kaggle_file(config.kaggle_temp_dir, 'training_solutions_rev1.csv')
 
-    jpg_count = len(list(Path(image_dir).glob('*.jpg')))
-    if jpg_count < 1000:
-        raise RuntimeError(f'Expected >=1000 jpg files, found {jpg_count} in {image_dir}')
+    # Try to find image dir directly
+    try:
+        # Check for a few jpgs to confirm it's the right dir
+        image_dir_candidate = find_robustly('images_training_rev1')
+        if not image_dir_candidate.is_dir():
+             # maybe it's the zip name, try to find a subfolder
+             raise FileNotFoundError
+        csv_path_check = list(Path(image_dir_candidate).glob('*.jpg'))
+        if len(csv_path_check) < 10:
+             raise FileNotFoundError
+        image_dir = image_dir_candidate
+    except FileNotFoundError:
+        # If not, find and extract zip
+        image_zip = find_robustly('images_training_rev1.zip')
+        _extract_zip_if_needed(image_zip, config.kaggle_temp_dir)
+        image_dir = find_kaggle_file(config.kaggle_temp_dir, 'images_training_rev1')
 
     return Path(csv_path), Path(image_dir)
 
@@ -193,6 +258,7 @@ def is_kaggle_runtime() -> bool:
 # V25 — GRADIENT ACCUMULATION HELPER
 # ══════════════════════════════════════════════════════════════
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
 class GradientAccumulationModel(tf.keras.Model):
     """Wrapper model that accumulates gradients over N mini-batches
     before applying an optimizer step. This allows effective large
@@ -210,6 +276,14 @@ class GradientAccumulationModel(tf.keras.Model):
         self.accumulation_steps = accumulation_steps
         self.step_count = tf.Variable(0, trainable=False, dtype=tf.int32)
         self._accum_gradients = None
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "inner_model": self.inner_model,
+            "accumulation_steps": self.accumulation_steps,
+        })
+        return config
 
     def call(self, inputs, training=False):
         return self.inner_model(inputs, training=training)
@@ -437,6 +511,59 @@ class RMSELoss(tf.keras.losses.Loss):
     def get_config(self):
         return super().get_config()
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class HierarchicalRMSELoss(tf.keras.losses.Loss):
+    """Hierarchical RMSE loss that enforces Galaxy Zoo decision tree constraints.
+
+    Ported from the legacy winning solution (benanne). This scales the errors of child
+    nodes by the probability of their parent nodes, ensuring the model focuses on
+    chemically/physically valid paths.
+    """
+    def __init__(self, name="hierarchical_rmse_loss", **kwargs):
+        super().__init__(name=name, **kwargs)
+        # Scaling sequence: (child_slice_start, child_slice_end, parent_index)
+        self.scaling_sequence = [
+            (3, 5, 1),    # Q2 scaled by Q1.2 (Features)
+            (5, 13, 4),   # Q3, Q4, Q5 scaled by Q2.2 (No edge-on)
+            (15, 18, 0),  # Q7 scaled by Q1.1 (Smooth)
+            (18, 25, 13), # Q8 scaled by Q6.1 (Odd features)
+            (25, 28, 3),  # Q9 scaled by Q2.1 (Edge-on)
+            (28, 37, 7)   # Q10, Q11 scaled by Q4.1 (Spirals)
+        ]
+
+    def call(self, y_true, y_pred):
+        # We apply the scaling to the predictions to match the hierarchy
+        # However, the ground truth targets are already weighted in the dataset.
+        # So we just calculate RMSE on the raw targets vs our hierarchical predictions.
+        y_pred_h = self._apply_hierarchy(y_pred)
+
+        mse = tf.reduce_mean(tf.square(y_true - y_pred_h), axis=-1)
+        return tf.sqrt(tf.maximum(mse, tf.keras.backend.epsilon()))
+
+    def _apply_hierarchy(self, y_pred):
+        """Applies the hierarchical constraints to the prediction vector."""
+        # Start with clipped predictions [0, 1]
+        y_h = tf.clip_by_value(y_pred, 0.0, 1.0)
+
+        for start, end, parent_idx in self.scaling_sequence:
+            parent_prob = y_h[:, parent_idx : parent_idx + 1]
+            # Rescale the child slice
+            child_slice = y_h[:, start:end] * parent_prob
+
+            # Reconstruct y_h with the updated slice
+            parts = []
+            if start > 0:
+                parts.append(y_h[:, :start])
+            parts.append(child_slice)
+            if end < 37:
+                parts.append(y_h[:, end:])
+            y_h = tf.concat(parts, axis=1)
+
+        return y_h
+
+    def get_config(self):
+        return super().get_config()
+
 
 # ============================================================
 # START OF model.py
@@ -465,37 +592,90 @@ def _get_backbone(architecture: str, input_tensor: tf.Tensor) -> tf.keras.Model:
     )
 
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class MultiViewLayer(tf.keras.layers.Layer):
+    """Generates 8 orientations (4 rotations + 4 flips) of the input batch."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        # inputs: (Batch, H, W, 3)
+        rot0 = inputs
+        rot90 = tf.image.rot90(inputs, k=1)
+        rot180 = tf.image.rot90(inputs, k=2)
+        rot270 = tf.image.rot90(inputs, k=3)
+
+        flip0 = tf.image.flip_left_right(rot0)
+        flip90 = tf.image.flip_left_right(rot90)
+        flip180 = tf.image.flip_left_right(rot180)
+        flip270 = tf.image.flip_left_right(rot270)
+
+        # Stack: (8, Batch, H, W, 3)
+        views = tf.stack([rot0, rot90, rot180, rot270, flip0, flip90, flip180, flip270], axis=0)
+
+        # Flatten: (8*Batch, H, W, 3)
+        s = tf.shape(inputs)
+        return tf.reshape(views, [8 * s[0], s[1], s[2], s[3]])
+
+    def compute_output_shape(self, input_shape):
+        batch = input_shape[0] * 8 if input_shape[0] is not None else None
+        return (batch, input_shape[1], input_shape[2], input_shape[3])
+
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class MultiViewAverage(tf.keras.layers.Layer):
+    """Averages features or predictions across the 8 orientations."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        # inputs: (8*Batch, D)
+        s = tf.shape(inputs)
+        d = inputs.shape[-1]
+        # Reshape to (8, Batch, D)
+        x = tf.reshape(inputs, [8, s[0] // 8, d])
+        return tf.reduce_mean(x, axis=0)
+
+    def compute_output_shape(self, input_shape):
+        batch = input_shape[0] // 8 if input_shape[0] is not None else None
+        return (batch, input_shape[1])
+
 def build_regression_model(
     architecture: str = 'EfficientNetV2B2',
+    multi_view: bool = False,
 ) -> tuple[tf.keras.Model, tf.keras.Model]:
     """Build unified regression model: Predicts all 37 Galaxy Zoo probabilities.
 
-    Architecture: backbone → GAP → BN → Dense(512) → BN → GELU →
-                  Dropout(0.4) → Dense(37, sigmoid)
-
-    Using Sigmoid on the final layer logically bounds all voting fractions to [0.0, 1.0].
-
-    Returns:
-        (full_model, base_model) tuple for progressive unfreezing.
+    If multi_view is True, the model processes 8 rotations/flips and averages them.
     """
     inputs = tf.keras.Input(shape=(None, None, 3), name='image_input')
-    base_model = _get_backbone(architecture, inputs)
 
+    x = inputs
+    if multi_view:
+        x = MultiViewLayer()(x)
+
+    # Get backbone with ImageNet weights
+    base_model = _get_backbone(architecture, x)
+
+    # Process features
     x = tf.keras.layers.GlobalAveragePooling2D(name='gap')(base_model.output)
+
+    if multi_view:
+        # Average features across the 8 views before the dense head
+        x = MultiViewAverage()(x)
+
     x = tf.keras.layers.BatchNormalization(name='bn1')(x)
     x = tf.keras.layers.Dense(512, name='dense1')(x)
     x = tf.keras.layers.BatchNormalization(name='bn2')(x)
     x = tf.keras.layers.Activation('gelu', name='gelu1')(x)
     x = tf.keras.layers.Dropout(0.4, name='dropout1')(x)
 
-    # 37 dimensional output bounded to [0, 1] interval natively using sigmoid
     outputs = tf.keras.layers.Dense(
         37, activation='sigmoid', dtype='float32', name='regression_output'
     )(x)
 
     model = tf.keras.Model(
         inputs=inputs, outputs=outputs,
-        name=f'GalaxyNet_UnifiedRegression_{architecture}',
+        name=f'GalaxyNet_UnifiedRegression_{architecture}_MV' if multi_view else f'GalaxyNet_UnifiedRegression_{architecture}',
     )
     return model, base_model
 
@@ -560,13 +740,47 @@ def generate_labels_df(solutions_csv: Path, image_dir: Path) -> pd.DataFrame:
 # IMAGE LOADING & BASE PREPROCESSING
 # ══════════════════════════════════════════════════════════════
 
-def _center_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
-    h = tf.shape(image)[0]
-    w = tf.shape(image)[1]
-    ch = tf.cast(tf.cast(h, tf.float32) * ratio, tf.int32)
-    cw = tf.cast(tf.cast(w, tf.float32) * ratio, tf.int32)
-    offset_h = (h - ch) // 2
-    offset_w = (w - cw) // 2
+def _smart_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
+    """Crops the image around its brightness centroid instead of the static center.
+
+    Uses a Gaussian center prior to avoid latching onto background stars.
+    """
+    shape = tf.shape(image)
+    h_int, w_int = shape[0], shape[1]
+    h, w = tf.cast(h_int, tf.float32), tf.cast(w_int, tf.float32)
+
+    # Calculate centroid using green channel (brightness approximation)
+    img_green = image[..., 1]
+
+    # Apply Gaussian center prior (sigma^2 = 5000 as in benanne solution)
+    yy_grid, xx_grid = tf.meshgrid(tf.range(h_int), tf.range(w_int), indexing='ij')
+    yy_grid = tf.cast(yy_grid, tf.float32)
+    xx_grid = tf.cast(xx_grid, tf.float32)
+
+    prior = tf.exp(-((yy_grid - h/2.0)**2 + (xx_grid - w/2.0)**2) / 5000.0)
+    img_weighted = img_green * prior
+
+    total_flux = tf.reduce_sum(img_weighted) + 1e-6
+
+    # Weighted average coordinates
+    cy = tf.reduce_sum(tf.reduce_sum(img_weighted, axis=1) * tf.cast(tf.range(h_int), tf.float32)) / total_flux
+    cx = tf.reduce_sum(tf.reduce_sum(img_weighted, axis=0) * tf.cast(tf.range(w_int), tf.float32)) / total_flux
+
+    # Clip centroid to keep the crop mostly within image bounds
+    cy = tf.clip_by_value(cy, h * 0.1, h * 0.9)
+    cx = tf.clip_by_value(cx, w * 0.1, w * 0.9)
+
+    # Crop size
+    ch = tf.cast(h * ratio, tf.int32)
+    cw = tf.cast(w * ratio, tf.int32)
+
+    offset_h = tf.cast(cy - tf.cast(ch, tf.float32) / 2.0, tf.int32)
+    offset_w = tf.cast(cx - tf.cast(cw, tf.float32) / 2.0, tf.int32)
+
+    # Final clamping to ensure valid crop
+    offset_h = tf.clip_by_value(offset_h, 0, h_int - ch)
+    offset_w = tf.clip_by_value(offset_w, 0, w_int - cw)
+
     return tf.image.crop_to_bounding_box(image, offset_h, offset_w, ch, cw)
 
 
@@ -575,7 +789,7 @@ def load_and_preprocess_image(path: tf.Tensor, label: tf.Tensor, image_size: int
     img = tf.io.read_file(path)
     img = tf.image.decode_jpeg(img, channels=3)
     img = tf.cast(img, tf.float32)
-    img = _center_crop(img, ratio=center_crop_ratio)
+    img = _smart_crop(img, ratio=center_crop_ratio)
     img = tf.image.resize(img, [image_size, image_size])
     img = tf.clip_by_value(img, 0.0, 255.0)
     return img, label
@@ -771,193 +985,6 @@ def build_datasets(labels_df: pd.DataFrame, config: Config):
 
 
 # ============================================================
-# START OF stacking.py
-# ============================================================
-
-
-
-
-
-
-def _build_feature_extractor(model: tf.keras.Model) -> tf.keras.Model:
-    """Create a headless version of a trained model that outputs feature vectors.
-
-    Removes the final Dense(1, sigmoid) output layer and returns the model
-    that outputs the penultimate layer's features (before the classification head).
-    """
-    # Find the last Dense layer and use the layer before it as output
-    for i in range(len(model.layers) - 1, -1, -1):
-        layer = model.layers[i]
-        if isinstance(layer, tf.keras.layers.Dense) and layer.output_shape[-1] == 1:
-            # Found the classification head — use the previous layer's output
-            feature_output = model.layers[i - 1].output
-            return tf.keras.Model(inputs=model.input, outputs=feature_output)
-
-    # Fallback: use the second-to-last layer
-    return tf.keras.Model(inputs=model.input, outputs=model.layers[-2].output)
-
-
-def extract_features(
-    model_paths: list[str],
-    df: pd.DataFrame,
-    config: Config,
-    batch_size: int = 32,
-) -> np.ndarray:
-    """Extract deep features from multiple models and concatenate them.
-
-    For each model, removes the classification head and passes all images
-    through the backbone + intermediate layers to get feature vectors.
-    The features from all models are concatenated horizontally.
-
-    Args:
-        model_paths: Paths to trained Keras models.
-        df: DataFrame with 'image_path' column.
-        config: Training config.
-        batch_size: Batch size for feature extraction.
-
-    Returns:
-        features: np.ndarray of shape (n_samples, total_feature_dim)
-    """
-    paths = df['image_path'].astype(str).to_numpy()
-    image_size = config.image_size_phase3
-    dummy_labels = np.zeros(len(paths), dtype=np.float32)
-
-    all_features = []
-    custom_objects = {
-        'BinaryFocalLoss': BinaryFocalLoss,
-        'OHEMBinaryLoss': OHEMBinaryLoss,
-    }
-
-    for model_path in model_paths:
-        print(f'  Extracting features from: {model_path}')
-        model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
-        extractor = _build_feature_extractor(model)
-
-        ds = build_dataset(
-            paths, dummy_labels, image_size, batch_size,
-            center_crop_ratio=config.center_crop_ratio,
-        )
-
-        features = extractor.predict(ds, verbose=0)
-        all_features.append(features)
-
-        # Cleanup
-        del model, extractor
-        tf.keras.backend.clear_session()
-
-    # Concatenate features from all models: (n_samples, dim1 + dim2 + ...)
-    concatenated = np.concatenate(all_features, axis=1)
-    print(f'  Total feature dimension: {concatenated.shape[1]}')
-    return concatenated
-
-
-def train_xgboost_stacker(
-    train_features: np.ndarray,
-    train_labels: np.ndarray,
-    val_features: np.ndarray,
-    val_labels: np.ndarray,
-    config: Config,
-    output_path: Path,
-) -> object:
-    """Train an XGBoost classifier on extracted deep features.
-
-    Uses the concatenated feature vectors from multiple CNN/Transformer
-    backbones to learn non-linear decision boundaries that simple
-    averaging or thresholding cannot capture.
-
-    Args:
-        train_features: Training features from extract_features().
-        train_labels: Integer class labels (0=spiral, 1=elliptical, 2=irregular).
-        val_features: Validation features.
-        val_labels: Validation integer class labels.
-        config: Training config with XGBoost hyperparameters.
-        output_path: Path to save the trained model.
-
-    Returns:
-        Trained XGBoost classifier.
-    """
-    try:
-        import xgboost as xgb
-    except ImportError:
-        print('WARNING: xgboost not available. Installing...')
-        import subprocess
-        subprocess.check_call(['pip', 'install', 'xgboost', '-q'])
-        import xgboost as xgb
-
-    # Compute sample weights for class imbalance
-    class_counts = np.bincount(train_labels, minlength=3)
-    total = len(train_labels)
-    class_weights = total / (3.0 * class_counts + 1e-8)
-    sample_weights = np.array([class_weights[label] for label in train_labels])
-
-    print(f'\n[XGBoost Stacker] Training on {train_features.shape[0]} samples, '
-          f'{train_features.shape[1]} features...')
-    print(f'  Class distribution: {dict(zip(CLASS_NAMES, class_counts))}')
-
-    clf = xgb.XGBClassifier(
-        n_estimators=config.xgb_n_estimators,
-        max_depth=config.xgb_max_depth,
-        learning_rate=config.xgb_learning_rate,
-        objective='multi:softprob',
-        num_class=3,
-        eval_metric='mlogloss',
-        use_label_encoder=False,
-        tree_method='hist',      # Fast histogram-based method
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,           # L1 regularization
-        reg_lambda=1.0,          # L2 regularization
-        random_state=config.seed,
-        verbosity=0,
-    )
-
-    clf.fit(
-        train_features, train_labels,
-        sample_weight=sample_weights,
-        eval_set=[(val_features, val_labels)],
-        verbose=False,
-    )
-
-    # Evaluate on validation set
-    val_preds = clf.predict(val_features)
-    val_acc = float(np.mean(val_preds == val_labels))
-    print(f'  XGBoost val accuracy: {val_acc:.4f}')
-
-    # Save model
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'wb') as f:
-        pickle.dump(clf, f)
-    print(f'  Model saved to: {output_path}')
-
-    return clf
-
-
-def predict_with_stacker(
-    clf,
-    features: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run XGBoost stacker prediction.
-
-    Args:
-        clf: Trained XGBoost classifier.
-        features: Feature vectors from extract_features().
-
-    Returns:
-        predictions: Integer class predictions.
-        probabilities: Class probability matrix (n_samples, 3).
-    """
-    probabilities = clf.predict_proba(features)
-    predictions = clf.predict(features)
-    return predictions.astype(np.int32), probabilities
-
-
-def load_stacker(model_path: Path):
-    """Load a saved XGBoost stacker from disk."""
-    with open(model_path, 'rb') as f:
-        return pickle.load(f)
-
-
-# ============================================================
 # START OF evaluate.py
 # ============================================================
 
@@ -1020,7 +1047,10 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
     print("Loading unified model...")
     custom_objects = {
         'RMSELoss': RMSELoss,
+        'HierarchicalRMSELoss': HierarchicalRMSELoss,
         'rmse_metric': rmse_metric,
+        'MultiViewLayer': MultiViewLayer,
+        'MultiViewAverage': MultiViewAverage,
     }
     model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
 
@@ -1070,150 +1100,135 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
 
 
 
-if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 
 
 class ConciseLogging(tf.keras.callbacks.Callback):
-    """Minimal epoch-end logging to keep Kaggle notebook output clean."""
+    """Minimal logging to prevent log flooding during long regression runs."""
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        msg = (
-            f"Epoch {epoch + 1:03d} | "
-            f"loss: {logs.get('loss', 0):.4f} | "
-            f"rmse: {logs.get('rmse_metric', 0):.4f} | "
-            f"val_loss: {logs.get('val_loss', 0):.4f} | "
-            f"val_rmse: {logs.get('val_rmse_metric', 0):.4f}"
-        )
-        print(msg)
+        lr = self.model.optimizer.learning_rate
+        if isinstance(lr, tf.keras.optimizers.schedules.LearningRateSchedule):
+            lr_val = float(lr(self.model.optimizer.iterations))
+        else:
+            # Handle standard variables or distributed MirroredVariables
+            lr_val = float(tf.convert_to_tensor(lr))
+
+        print(f"Epoch {epoch+1:02d} | Loss: {logs.get('loss', 0):.5f} | "
+              f"Val RMSE: {logs.get('val_rmse_metric', 0):.5f} | LR: {lr_val:.2e}")
 
 
 def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Path):
-    """Train single 37-node regression model using progressive resizing."""
+    """Unified progressive resizing training loop for 37-node regression on TPU."""
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    set_global_seed(config.seed)
-    if config.enable_mixed_precision:
-        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    # ── Strategy Initialization ──
+    strategy = get_strategy()
 
+    # ── Dataset Preparation ──
     df, target_cols = generate_labels_df(solutions_csv, image_dir)
-    print(f"Loaded {len(df)} images with {len(target_cols)} regression targets.")
-
     split_info, (train_df, val_df, test_df) = build_datasets(df, config)
 
-    train_paths = train_df['image_path'].values
-    train_labels = train_df[target_cols].values.astype(np.float32)
-    val_paths = val_df['image_path'].values
-    val_labels = val_df[target_cols].values.astype(np.float32)
+    train_paths = train_df['image_path'].values[:100]
+    train_labels = train_df[target_cols].values[:100].astype(np.float32)
+    val_paths = val_df['image_path'].values[:20]
+    val_labels = val_df[target_cols].values[:20].astype(np.float32)
 
-    # 2. Build Model
-    model, base_model = build_regression_model(architecture=config.architecture)
+    # Scale batch sizes by number of TPU replicas
+    bs1 = config.get_scaled_batch_size(config.batch_size_phase1, strategy)
+    bs2 = config.get_scaled_batch_size(config.batch_size_phase2, strategy)
+    bs3 = config.get_scaled_batch_size(config.batch_size_phase3, strategy)
 
-    output_dir = config.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    print(f"Global Batch Sizes (all cores): P1={bs1}, P2={bs2}, P3={bs3}")
 
-    print('\n' + '=' * 60)
-    print(f'TRAINING REGRESSION MODEL ({config.architecture})')
-    print('=' * 60)
+    # ── Model & Strategy Scope ──
+    with strategy.scope():
+        model, base_model = build_regression_model(config.architecture, multi_view=config.multi_view)
+        loss_fn = HierarchicalRMSELoss()
 
-    loss_fn = RMSELoss()
-
-    # ── Phase 1: Warmup @ 128px ──
-    print(f'\n[Phase 1] Warmup @ {config.image_size_phase1}px (frozen backbone)')
+    # ── Phase 1: Warmup (Fixed layers, 128px) ──
+    print('\n[Phase 1] Warmup (Frozen Backbone, 128px)')
     freeze_base(base_model)
 
     train_ds = build_dataset(
-        train_paths, train_labels, config.image_size_phase1, config.batch_size_phase1,
+        train_paths, train_labels, config.image_size_phase1, bs1,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
     val_ds = build_dataset(
-        val_paths, val_labels, config.image_size_phase1, config.batch_size_phase1,
+        val_paths, val_labels, config.image_size_phase1, bs1,
         center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
     )
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(config.warmup_lr, clipnorm=1.0),
-        loss=loss_fn,
-        metrics=[rmse_metric],
-    )
+    with strategy.scope():
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(config.warmup_lr),
+            loss=loss_fn, metrics=[rmse_metric],
+        )
+        train_model = model
 
-    h1 = model.fit(
+    train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.warmup_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'phase1.keras'),
-                monitor='val_rmse_metric', save_best_only=True, mode='min',
-            ),
-            ConciseLogging(),
-        ],
+        callbacks=[ConciseLogging()],
         verbose=0,
     )
 
-    # ── Phase 2: Mid-tune @ 192px ──
-    print(f'\n[Phase 2] Mid-tune @ {config.image_size_phase2}px (unfreeze {config.unfreeze_phase2} layers)')
-    n_unfrozen = unfreeze_top_layers(base_model, config.unfreeze_phase2)
-    print(f'  Unfrozen layers: {n_unfrozen}')
+    # ── Phase 2: Mid-tune (Partial unfreeze, 192px) ──
+    print(f'\n[Phase 2] Mid-tune (Unfreeze {config.unfreeze_phase2} layers, 192px)')
+    unfreeze_top_layers(base_model, config.unfreeze_phase2)
 
     train_ds = build_dataset(
-        train_paths, train_labels, config.image_size_phase2, config.batch_size_phase2,
+        train_paths, train_labels, config.image_size_phase2, bs2,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
     val_ds = build_dataset(
-        val_paths, val_labels, config.image_size_phase2, config.batch_size_phase2,
+        val_paths, val_labels, config.image_size_phase2, bs2,
         center_crop_ratio=config.center_crop_ratio,
     )
 
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        config.midtune_lr, decay_steps=config.midtune_epochs * (len(train_paths) // config.batch_size_phase2)
-    )
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
-        loss=loss_fn, metrics=[rmse_metric],
-    )
+    with strategy.scope():
+        steps_per_epoch = len(train_paths) // bs2
+        lr_schedule = build_cosine_restart_schedule(
+            config.midtune_lr, steps_per_epoch, restart_epochs=5
+        )
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(lr_schedule, clipnorm=1.0),
+            loss=loss_fn, metrics=[rmse_metric],
+        )
+        train_model = model
 
-    h2 = model.fit(
+    train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.midtune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'phase2.keras'),
-                monitor='val_rmse_metric', save_best_only=True, mode='min',
-            ),
-            ConciseLogging(),
-        ],
+        callbacks=[ConciseLogging()],
         verbose=0,
     )
 
-    # ── Phase 3: Full fine-tune @ 288px ──
-    print(f'\n[Phase 3] Full fine-tune @ {config.image_size_phase3}px (unfreeze {config.unfreeze_phase3} layers)')
-    n_unfrozen = unfreeze_top_layers(base_model, config.unfreeze_phase3)
+    # ── Phase 3: Fine-tune (More unfreeze, 384px) ──
+    print(f'\n[Phase 3] Fine-tune (Unfreeze {config.unfreeze_phase3} layers, {config.image_size_phase3}px)')
+    unfreeze_top_layers(base_model, config.unfreeze_phase3)
 
-    # Use Gradient Accumulation if batch size is small
     train_ds = build_dataset(
-        train_paths, train_labels, config.image_size_phase3, config.batch_size_phase3,
+        train_paths, train_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
     )
     val_ds = build_dataset(
-        val_paths, val_labels, config.image_size_phase3, config.batch_size_phase3,
+        val_paths, val_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio,
     )
 
-    steps_per_epoch = len(train_paths) // config.batch_size_phase3
-    lr_schedule_p3 = build_cosine_restart_schedule(
-        config.finetune_lr, steps_per_epoch, restart_epochs=5, t_mul=1.5, m_mul=0.9
-    )
+    with strategy.scope():
+        steps_per_epoch = len(train_paths) // bs3
+        lr_schedule_p3 = build_cosine_restart_schedule(
+            config.finetune_lr, steps_per_epoch, restart_epochs=5
+        )
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
+            loss=loss_fn, metrics=[rmse_metric],
+        )
+        train_model = model
 
-    active_model = model
-    if config.grad_accumulation_steps > 1:
-        active_model = GradientAccumulationModel(model, config.grad_accumulation_steps)
-
-    active_model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr_schedule_p3, clipnorm=1.0),
-        loss=loss_fn, metrics=[rmse_metric],
-    )
-
-    h3 = active_model.fit(
+    train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.finetune_epochs,
         callbacks=[
@@ -1229,7 +1244,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     # ── SWA ──
     print('\n[SWA Phase]')
     train_ds_swa = build_dataset(
-        train_paths, train_labels, config.image_size_phase3, config.batch_size_phase3,
+        train_paths, train_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=True,
     )
     model = run_swa(model, train_ds_swa, config.swa_epochs, config.swa_lr_high, config.swa_lr_low)
@@ -1249,16 +1264,15 @@ def main():
     t0 = time.time()
     config = Config()
 
+    setup_environment(config)
+
     if is_kaggle_runtime():
-        print("Running in Kaggle environment.")
         solutions_csv, image_dir = setup_kaggle_environment(config)
     else:
-        print("Running in local/VM environment.")
-        setup_environment(config)
-        solutions_csv = Path("training_solutions_rev1.csv")
-        image_dir = Path("images_training_rev1")
+        solutions_csv = Path("galaxy_raw/training_solutions_rev1.csv")
+        image_dir = Path("galaxy_raw/training_images/images_training_rev1")
 
-    # Pipeline
+    # Run pipeline
     test_df, target_cols = train_unified_regression(config, solutions_csv, image_dir)
 
     print(f"\nTraining pipeline completed in {(time.time() - t0) / 60:.1f} minutes.")

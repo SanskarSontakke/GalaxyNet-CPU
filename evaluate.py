@@ -10,7 +10,8 @@ from tqdm import tqdm
 
 from config import Config
 from dataset import build_dataset
-from losses import RMSELoss, rmse_metric
+from losses import HierarchicalRMSELoss, RMSELoss, rmse_metric
+from model import MultiViewLayer, MultiViewAverage
 
 
 def calculate_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -66,7 +67,10 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
     print("Loading unified model...")
     custom_objects = {
         'RMSELoss': RMSELoss,
+        'HierarchicalRMSELoss': HierarchicalRMSELoss,
         'rmse_metric': rmse_metric,
+        'MultiViewLayer': MultiViewLayer,
+        'MultiViewAverage': MultiViewAverage,
     }
     model = tf.keras.models.load_model(model_path, custom_objects=custom_objects)
     
