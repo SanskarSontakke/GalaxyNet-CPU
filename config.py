@@ -18,10 +18,10 @@ class Config:
     image_size_phase3: int = 424
     center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device - Optimized for T4 16GB) ──
-    batch_size_phase1: int = 16
-    batch_size_phase2: int = 16
-    batch_size_phase3: int = 16
+    # ── Batch sizes (BASE per device - Conservative for dual T4 16GB GPUs) ──
+    batch_size_phase1: int = 8
+    batch_size_phase2: int = 8
+    batch_size_phase3: int = 8
     grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
