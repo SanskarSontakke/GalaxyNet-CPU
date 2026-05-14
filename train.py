@@ -3,11 +3,21 @@ from __future__ import annotations
 import gc
 import os
 import time
+import warnings
 from pathlib import Path
 
-# Suppress noisy TF/Keras logs before importing TensorFlow.
+# Suppress noisy TF/Keras/JAX logs
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['ABSL_LOGGING_LEVEL'] = 'error'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' # Suppress oneDNN notice
+
+import logging
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+logging.getLogger('absl').setLevel(logging.ERROR)
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*layout failed: INVALID_ARGUMENT.*')
 
 import numpy as np
 import tensorflow as tf

@@ -57,8 +57,8 @@ def setup_environment(config: Config) -> None:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(f"Warning: Could not set GPU memory growth: {e}")
+        except RuntimeError:
+            pass
 
     if config.enable_mixed_precision:
         # Determine policy based on ACTUAL hardware presence

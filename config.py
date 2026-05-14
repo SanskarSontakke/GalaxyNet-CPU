@@ -18,10 +18,10 @@ class Config:
     image_size_phase3: int = 424
     center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device - Conservative for dual T4 16GB GPUs) ──
-    batch_size_phase1: int = 8
-    batch_size_phase2: int = 8
-    batch_size_phase3: int = 8
+    # ── Batch sizes (BASE per device - Highly conservative for dual T4 16GB GPUs to avoid System OOM) ──
+    batch_size_phase1: int = 4
+    batch_size_phase2: int = 4
+    batch_size_phase3: int = 4
     grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
@@ -34,10 +34,10 @@ class Config:
     architecture: str = 'BenanneNetTF'
     multi_view: bool = False
     
-    # ── Training Schedule ──────────────────────────────────────
-    warmup_epochs: int = 8
-    midtune_epochs: int = 10
-    finetune_epochs: int = 12
+    # ── Training Schedule (TEST RUN) ───────────────────────────
+    warmup_epochs: int = 1
+    midtune_epochs: int = 1
+    finetune_epochs: int = 1
     
     warmup_lr: float = 4e-2
     midtune_lr: float = 4e-3

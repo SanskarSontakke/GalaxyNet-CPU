@@ -4,29 +4,61 @@
 
 from __future__ import annotations
 
-import argparse
-import datetime
-import gc
-import json
-import math
-import multiprocessing
 import os
-import pickle
-import random
-import subprocess
 import sys
-import time
-import zipfile
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Tuple
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import tensorflow as tf
+# Drastic measures for C++ level logs that ignore environment variables
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ABSL_LOGGING_LEVEL'] = 'error'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MAX_VLOG_LEVEL'] = '0'
+
+# Save stderr and redirect to /dev/null
+_stderr_fd = sys.stderr.fileno()
+_saved_stderr_fd = os.dup(_stderr_fd)
+_devnull = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_devnull, _stderr_fd)
+
+try:
+    import argparse
+    import datetime
+    import gc
+    import json
+    import math
+    import multiprocessing
+    import pickle
+    import random
+    import subprocess
+    import time
+    import warnings
+    import zipfile
+    from dataclasses import asdict, dataclass, field
+    from pathlib import Path
+    from typing import Tuple
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    # Suppress Python-level warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+    warnings.filterwarnings('ignore', category=FutureWarning)
+    warnings.filterwarnings('ignore', message='.*layout failed: INVALID_ARGUMENT.*')
+    warnings.filterwarnings('ignore', message='.*Skipping loop optimization.*')
+
+    import tensorflow as tf
+    import logging
+    logging.getLogger('tensorflow').setLevel(logging.ERROR)
+    logging.getLogger('absl').setLevel(logging.ERROR)
+
+    tf.keras.utils.disable_interactive_logging()
+finally:
+    # Restore stderr
+    os.dup2(_saved_stderr_fd, _stderr_fd)
+    os.close(_saved_stderr_fd)
+    os.close(_devnull)
 from sklearn.metrics import (
     brier_score_loss,
     classification_report,
@@ -68,10 +100,10 @@ class Config:
     image_size_phase3: int = 424
     center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device - Conservative for dual T4 16GB GPUs) ──
-    batch_size_phase1: int = 8
-    batch_size_phase2: int = 8
-    batch_size_phase3: int = 8
+    # ── Batch sizes (BASE per device - Highly conservative for dual T4 16GB GPUs to avoid System OOM) ──
+    batch_size_phase1: int = 4
+    batch_size_phase2: int = 4
+    batch_size_phase3: int = 4
     grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
@@ -84,10 +116,10 @@ class Config:
     architecture: str = 'BenanneNetTF'
     multi_view: bool = False
 
-    # ── Training Schedule ──────────────────────────────────────
-    warmup_epochs: int = 8
-    midtune_epochs: int = 10
-    finetune_epochs: int = 12
+    # ── Training Schedule (TEST RUN) ───────────────────────────
+    warmup_epochs: int = 1
+    midtune_epochs: int = 1
+    finetune_epochs: int = 1
 
     warmup_lr: float = 4e-2
     midtune_lr: float = 4e-3
@@ -177,8 +209,8 @@ def setup_environment(config: Config) -> None:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(f"Warning: Could not set GPU memory growth: {e}")
+        except RuntimeError:
+            pass
 
     if config.enable_mixed_precision:
         # Determine policy based on ACTUAL hardware presence
@@ -1465,10 +1497,20 @@ def evaluate_regression(config: Config, test_df: pd.DataFrame, target_cols: list
 # ============================================================
 
 
+import warnings
 
-# Suppress noisy TF/Keras logs before importing TensorFlow.
+# Suppress noisy TF/Keras/JAX logs
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['ABSL_LOGGING_LEVEL'] = 'error'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' # Suppress oneDNN notice
+
+import logging
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+logging.getLogger('absl').setLevel(logging.ERROR)
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*layout failed: INVALID_ARGUMENT.*')
 
 
 tf.keras.utils.disable_interactive_logging()

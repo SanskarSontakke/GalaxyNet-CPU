@@ -51,29 +51,61 @@ def consolidate():
 
 from __future__ import annotations
 
-import argparse
-import datetime
-import gc
-import json
-import math
-import multiprocessing
 import os
-import pickle
-import random
-import subprocess
 import sys
-import time
-import zipfile
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Tuple
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import tensorflow as tf
+# Drastic measures for C++ level logs that ignore environment variables
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['ABSL_LOGGING_LEVEL'] = 'error'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MAX_VLOG_LEVEL'] = '0'
+
+# Save stderr and redirect to /dev/null
+_stderr_fd = sys.stderr.fileno()
+_saved_stderr_fd = os.dup(_stderr_fd)
+_devnull = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_devnull, _stderr_fd)
+
+try:
+    import argparse
+    import datetime
+    import gc
+    import json
+    import math
+    import multiprocessing
+    import pickle
+    import random
+    import subprocess
+    import time
+    import warnings
+    import zipfile
+    from dataclasses import asdict, dataclass, field
+    from pathlib import Path
+    from typing import Tuple
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    # Suppress Python-level warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+    warnings.filterwarnings('ignore', category=FutureWarning)
+    warnings.filterwarnings('ignore', message='.*layout failed: INVALID_ARGUMENT.*')
+    warnings.filterwarnings('ignore', message='.*Skipping loop optimization.*')
+
+    import tensorflow as tf
+    import logging
+    logging.getLogger('tensorflow').setLevel(logging.ERROR)
+    logging.getLogger('absl').setLevel(logging.ERROR)
+
+    tf.keras.utils.disable_interactive_logging()
+finally:
+    # Restore stderr
+    os.dup2(_saved_stderr_fd, _stderr_fd)
+    os.close(_saved_stderr_fd)
+    os.close(_devnull)
 from sklearn.metrics import (
     brier_score_loss,
     classification_report,
