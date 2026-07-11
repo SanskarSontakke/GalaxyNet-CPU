@@ -1,9 +1,50 @@
-data
-galaxy_raw
-outputs
-.venv
-*.keras
-*.json
-__pycache__/
-*.pyc
+# Data and outputs
+data/
+galaxy_raw/
+outputs/
 kaggle_logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Models and data
+*.keras
+*.h5
+*.pb
+*.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Misc
+*.log
+*.tmp
+.env
