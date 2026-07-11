@@ -115,6 +115,36 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
             model.compile(optimizer=optimizer, loss=loss_fn, metrics=[rmse_metric])
             return model
 
+    # ── Callbacks shared across phases ──
+    # We keep a single best checkpoint on disk across all three phases. The
+    # running best validation RMSE is threaded into each phase's checkpoint via
+    # `initial_value_threshold`, so a poor early epoch of a later phase can never
+    # overwrite a better model saved by an earlier phase. EarlyStopping restores
+    # each phase's best weights before the next phase continues from them.
+    checkpoint_path = str(output_dir / 'unified_best.keras')
+    best_val_rmse = float('inf')
+
+    def phase_callbacks():
+        return [
+            tf.keras.callbacks.ModelCheckpoint(
+                checkpoint_path,
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
+                initial_value_threshold=best_val_rmse, verbose=0,
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_rmse_metric', mode='min',
+                patience=config.early_stop_patience,
+                restore_best_weights=True, verbose=0,
+            ),
+            ConciseLogging(),
+        ]
+
+    def update_best(history):
+        nonlocal best_val_rmse
+        vals = history.history.get('val_rmse_metric', [])
+        if vals:
+            best_val_rmse = min(best_val_rmse, min(vals))
+
     # ── Phase 1: Warmup (Fixed layers, 128px) ──
     print(f'\n[Phase 1] Warmup (Frozen Backbone, {config.image_size_phase1}px)')
     freeze_base(base_model)
@@ -131,12 +161,13 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
 
     train_model = compile_for_phase(config.warmup_lr)
 
-    train_model.fit(
+    history = train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.warmup_epochs,
-        callbacks=[ConciseLogging()],
+        callbacks=phase_callbacks(),
         verbose=0,
     )
+    update_best(history)
 
     # ── Phase 2: Mid-tune (Partial unfreeze, 192px) ──
     print(f'\n[Phase 2] Mid-tune (Unfreeze {config.unfreeze_phase2} layers, {config.image_size_phase2}px)')
@@ -158,12 +189,13 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
         None if uses_benanne_schedule else steps_per_epoch,
     )
 
-    train_model.fit(
+    history = train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.midtune_epochs,
-        callbacks=[ConciseLogging()],
+        callbacks=phase_callbacks(),
         verbose=0,
     )
+    update_best(history)
 
     # ── Phase 3: Fine-tune (More unfreeze, 384px) ──
     print(f'\n[Phase 3] Fine-tune (Unfreeze {config.unfreeze_phase3} layers, {config.image_size_phase3}px)')
@@ -185,19 +217,13 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
         None if uses_benanne_schedule else steps_per_epoch,
     )
 
-    train_model.fit(
+    history = train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.finetune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'unified_best.keras'),
-                monitor='val_rmse_metric', save_best_only=True, mode='min',
-                verbose=0
-            ),
-            ConciseLogging(),
-        ],
+        callbacks=phase_callbacks(),
         verbose=0,
     )
+    update_best(history)
 
     # ── SWA ──
     if config.swa_epochs > 0 and not uses_benanne_schedule:

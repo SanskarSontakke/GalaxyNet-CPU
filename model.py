@@ -244,13 +244,29 @@ def build_regression_model(
     inputs = tf.keras.Input(shape=(None, None, 3), name='image_input')
 
     if architecture == 'BenanneNetTF':
-        x = BenannePartExtractor(name='benanne_parts')(inputs)
-        x = tf.keras.layers.Conv2D(32, 6, activation='relu', padding='valid', name='conv1')(x)
+        # Scale raw 0-255 pixels to [0, 1] before the from-scratch convnet.
+        # The benanne pipeline fed normalized inputs; sending raw 0-255 values
+        # into an un-normalized conv stack trained with SGD at lr=4e-2 makes
+        # early activations explode. Rescaling here fixes that at the source.
+        x = tf.keras.layers.Rescaling(1.0 / 255.0, name='rescale')(inputs)
+        x = BenannePartExtractor(name='benanne_parts')(x)
+        # Conv -> BatchNorm -> ReLU. BatchNorm is a modern addition (not in the
+        # original 2014 net); it stabilizes and speeds up from-scratch training
+        # and lets the high warmup learning rate work without diverging.
+        x = tf.keras.layers.Conv2D(32, 6, padding='valid', name='conv1')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv1')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv1')(x)
         x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool1')(x)
-        x = tf.keras.layers.Conv2D(64, 5, activation='relu', padding='valid', name='conv2')(x)
+        x = tf.keras.layers.Conv2D(64, 5, padding='valid', name='conv2')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv2')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv2')(x)
         x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool2')(x)
-        x = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='valid', name='conv3')(x)
-        x = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='valid', name='conv4')(x)
+        x = tf.keras.layers.Conv2D(128, 3, padding='valid', name='conv3')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv3')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv3')(x)
+        x = tf.keras.layers.Conv2D(128, 3, padding='valid', name='conv4')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv4')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv4')(x)
         x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool4')(x)
         x = tf.keras.layers.Flatten(name='flatten_parts')(x)
         x = PartFeatureMerge(name='merge_parts')(x)

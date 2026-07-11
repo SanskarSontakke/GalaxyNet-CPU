@@ -2,12 +2,20 @@ import tensorflow as tf
 
 @tf.keras.utils.register_keras_serializable(package="Custom")
 def rmse_metric(y_true, y_pred):
-    """Root Mean Squared Error for the 37 regression targets."""
+    """Root Mean Squared Error for the 37 regression targets.
+
+    Kaggle scores this competition with a single RMSE taken over every
+    (sample, target) pair flattened together, which is exactly what
+    evaluate.calculate_rmse computes. We therefore average the squared
+    error over BOTH axes before taking the square root, rather than taking
+    a per-sample RMSE first. This keeps the monitored validation metric on
+    the same scale as the reported evaluation score.
+    """
     # Cast to float32 to ensure compatibility with mixed precision
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
-    mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
-    return tf.maximum(0.0, tf.sqrt(mse))
+    mse = tf.reduce_mean(tf.square(y_true - y_pred))
+    return tf.sqrt(mse)
 
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class RMSELoss(tf.keras.losses.Loss):
@@ -23,8 +31,12 @@ class RMSELoss(tf.keras.losses.Loss):
         # Cast to float32 to ensure compatibility with mixed precision
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
-        # Calculate MSE across the 37 features
-        mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
+        # Mean squared error over every (sample, target) element in the batch.
+        # Reducing over both axes before the sqrt makes this the batch-level
+        # equivalent of the Kaggle metric (a single global RMSE), instead of
+        # averaging per-sample RMSEs — the two are not equal because sqrt is
+        # concave, and the global form is what the leaderboard rewards.
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
         # Apply sqrt with epsilon to prevent infinite gradient at exactly 0.0 variance
         return tf.sqrt(tf.maximum(mse, tf.keras.backend.epsilon()))
 
@@ -60,8 +72,9 @@ class HierarchicalRMSELoss(tf.keras.losses.Loss):
         y_pred = tf.cast(y_pred, tf.float32)
         
         y_pred_h = self._apply_hierarchy(y_pred)
-        
-        mse = tf.reduce_mean(tf.square(y_true - y_pred_h), axis=-1)
+
+        # Global reduction over both axes to mirror the Kaggle RMSE metric.
+        mse = tf.reduce_mean(tf.square(y_true - y_pred_h))
         return tf.sqrt(tf.maximum(mse, tf.keras.backend.epsilon()))
 
     def _apply_hierarchy(self, y_pred):

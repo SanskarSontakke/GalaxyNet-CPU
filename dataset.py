@@ -52,6 +52,12 @@ def _smart_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
     
     Uses a Gaussian center prior to avoid latching onto background stars.
     """
+    # A ratio >= 1.0 keeps the whole image, so the centroid math below is pure
+    # wasted compute (a full-image meshgrid + Gaussian per image, per epoch).
+    # The active config uses center_crop_ratio=1.0, so short-circuit here.
+    if ratio >= 1.0:
+        return image
+
     shape = tf.shape(image)
     h_int, w_int = shape[0], shape[1]
     h, w = tf.cast(h_int, tf.float32), tf.cast(w_int, tf.float32)

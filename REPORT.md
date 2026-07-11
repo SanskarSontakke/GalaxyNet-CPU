@@ -1,5 +1,12 @@
 # Model Performance Report: GalaxyNet Unified Regression
 
+> **Status note (needs re-measurement):** The figures below were produced by an earlier
+> EfficientNetV2B2-based configuration at 288px (see the "Key Insights" section). The current
+> repository default is the from-scratch `BenanneNetTF` network at 424px, so these numbers do
+> **not** describe the model produced by the current code. Re-run the pipeline and regenerate
+> this report before citing any of these values.
+> <!-- TODO: re-measure RMSE for the current BenanneNetTF default and update this report. -->
+
 This report summarizes the local verification of the `unified_best.keras` model, which was trained for **Root Mean Squared Error (RMSE)** optimization on the 37-node Galaxy Zoo target array.
 
 ## 📊 Global Performance

@@ -100,10 +100,15 @@ class Config:
     image_size_phase3: int = 424
     center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device - Highly conservative for dual T4 16GB GPUs to avoid System OOM) ──
-    batch_size_phase1: int = 4
-    batch_size_phase2: int = 4
-    batch_size_phase3: int = 4
+    # ── Batch sizes (BASE per device) ──
+    # BenanneNetTF is a small from-scratch convnet that immediately downsamples
+    # each image to 69x69 views, so its memory footprint is tiny and a batch of
+    # 4 leaves the accelerator badly underused with very noisy gradients. 32 is
+    # comfortable here. Lower these back toward 4-8 if you switch `architecture`
+    # to a heavy ImageNet backbone (EfficientNet/ConvNeXt) at full resolution.
+    batch_size_phase1: int = 32
+    batch_size_phase2: int = 32
+    batch_size_phase3: int = 32
     grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
@@ -116,10 +121,22 @@ class Config:
     architecture: str = 'BenanneNetTF'
     multi_view: bool = False
 
-    # ── Training Schedule (TEST RUN) ───────────────────────────
-    warmup_epochs: int = 1
-    midtune_epochs: int = 1
-    finetune_epochs: int = 1
+    # ── Training Schedule ──────────────────────────────────────
+    # These are epoch CAPS, not fixed counts: EarlyStopping(restore_best_weights)
+    # in train.py stops each phase once validation RMSE stops improving, so
+    # setting them generously is safe. The three phases form a manual step-decay
+    # of the SGD learning rate (4e-2 -> 4e-3 -> 4e-4), each starting from the
+    # best weights of the previous phase.
+    #
+    # NOTE: the original benanne solution trained for ~67 GPU-hours. A single
+    # Kaggle session is capped at 12h with no resume logic here, so treat these
+    # as the main dial to trade run time against accuracy and watch the clock.
+    warmup_epochs: int = 25
+    midtune_epochs: int = 15
+    finetune_epochs: int = 15
+
+    # EarlyStopping patience (epochs without val-RMSE improvement) per phase.
+    early_stop_patience: int = 6
 
     warmup_lr: float = 4e-2
     midtune_lr: float = 4e-3
@@ -554,12 +571,20 @@ def run_swa(
 
 @tf.keras.utils.register_keras_serializable(package="Custom")
 def rmse_metric(y_true, y_pred):
-    """Root Mean Squared Error for the 37 regression targets."""
+    """Root Mean Squared Error for the 37 regression targets.
+
+    Kaggle scores this competition with a single RMSE taken over every
+    (sample, target) pair flattened together, which is exactly what
+    evaluate.calculate_rmse computes. We therefore average the squared
+    error over BOTH axes before taking the square root, rather than taking
+    a per-sample RMSE first. This keeps the monitored validation metric on
+    the same scale as the reported evaluation score.
+    """
     # Cast to float32 to ensure compatibility with mixed precision
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
-    mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
-    return tf.maximum(0.0, tf.sqrt(mse))
+    mse = tf.reduce_mean(tf.square(y_true - y_pred))
+    return tf.sqrt(mse)
 
 @tf.keras.utils.register_keras_serializable(package="Custom")
 class RMSELoss(tf.keras.losses.Loss):
@@ -575,8 +600,12 @@ class RMSELoss(tf.keras.losses.Loss):
         # Cast to float32 to ensure compatibility with mixed precision
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
-        # Calculate MSE across the 37 features
-        mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)
+        # Mean squared error over every (sample, target) element in the batch.
+        # Reducing over both axes before the sqrt makes this the batch-level
+        # equivalent of the Kaggle metric (a single global RMSE), instead of
+        # averaging per-sample RMSEs — the two are not equal because sqrt is
+        # concave, and the global form is what the leaderboard rewards.
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
         # Apply sqrt with epsilon to prevent infinite gradient at exactly 0.0 variance
         return tf.sqrt(tf.maximum(mse, tf.keras.backend.epsilon()))
 
@@ -613,7 +642,8 @@ class HierarchicalRMSELoss(tf.keras.losses.Loss):
 
         y_pred_h = self._apply_hierarchy(y_pred)
 
-        mse = tf.reduce_mean(tf.square(y_true - y_pred_h), axis=-1)
+        # Global reduction over both axes to mirror the Kaggle RMSE metric.
+        mse = tf.reduce_mean(tf.square(y_true - y_pred_h))
         return tf.sqrt(tf.maximum(mse, tf.keras.backend.epsilon()))
 
     def _apply_hierarchy(self, y_pred):
@@ -889,13 +919,29 @@ def build_regression_model(
     inputs = tf.keras.Input(shape=(None, None, 3), name='image_input')
 
     if architecture == 'BenanneNetTF':
-        x = BenannePartExtractor(name='benanne_parts')(inputs)
-        x = tf.keras.layers.Conv2D(32, 6, activation='relu', padding='valid', name='conv1')(x)
+        # Scale raw 0-255 pixels to [0, 1] before the from-scratch convnet.
+        # The benanne pipeline fed normalized inputs; sending raw 0-255 values
+        # into an un-normalized conv stack trained with SGD at lr=4e-2 makes
+        # early activations explode. Rescaling here fixes that at the source.
+        x = tf.keras.layers.Rescaling(1.0 / 255.0, name='rescale')(inputs)
+        x = BenannePartExtractor(name='benanne_parts')(x)
+        # Conv -> BatchNorm -> ReLU. BatchNorm is a modern addition (not in the
+        # original 2014 net); it stabilizes and speeds up from-scratch training
+        # and lets the high warmup learning rate work without diverging.
+        x = tf.keras.layers.Conv2D(32, 6, padding='valid', name='conv1')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv1')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv1')(x)
         x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool1')(x)
-        x = tf.keras.layers.Conv2D(64, 5, activation='relu', padding='valid', name='conv2')(x)
+        x = tf.keras.layers.Conv2D(64, 5, padding='valid', name='conv2')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv2')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv2')(x)
         x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool2')(x)
-        x = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='valid', name='conv3')(x)
-        x = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='valid', name='conv4')(x)
+        x = tf.keras.layers.Conv2D(128, 3, padding='valid', name='conv3')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv3')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv3')(x)
+        x = tf.keras.layers.Conv2D(128, 3, padding='valid', name='conv4')(x)
+        x = tf.keras.layers.BatchNormalization(name='bn_conv4')(x)
+        x = tf.keras.layers.Activation('relu', name='relu_conv4')(x)
         x = tf.keras.layers.MaxPooling2D(pool_size=2, name='pool4')(x)
         x = tf.keras.layers.Flatten(name='flatten_parts')(x)
         x = PartFeatureMerge(name='merge_parts')(x)
@@ -1009,6 +1055,12 @@ def _smart_crop(image: tf.Tensor, ratio: float = 0.75) -> tf.Tensor:
 
     Uses a Gaussian center prior to avoid latching onto background stars.
     """
+    # A ratio >= 1.0 keeps the whole image, so the centroid math below is pure
+    # wasted compute (a full-image meshgrid + Gaussian per image, per epoch).
+    # The active config uses center_crop_ratio=1.0, so short-circuit here.
+    if ratio >= 1.0:
+        return image
+
     shape = tf.shape(image)
     h_int, w_int = shape[0], shape[1]
     h, w = tf.cast(h_int, tf.float32), tf.cast(w_int, tf.float32)
@@ -1583,6 +1635,36 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
             model.compile(optimizer=optimizer, loss=loss_fn, metrics=[rmse_metric])
             return model
 
+    # ── Callbacks shared across phases ──
+    # We keep a single best checkpoint on disk across all three phases. The
+    # running best validation RMSE is threaded into each phase's checkpoint via
+    # `initial_value_threshold`, so a poor early epoch of a later phase can never
+    # overwrite a better model saved by an earlier phase. EarlyStopping restores
+    # each phase's best weights before the next phase continues from them.
+    checkpoint_path = str(output_dir / 'unified_best.keras')
+    best_val_rmse = float('inf')
+
+    def phase_callbacks():
+        return [
+            tf.keras.callbacks.ModelCheckpoint(
+                checkpoint_path,
+                monitor='val_rmse_metric', save_best_only=True, mode='min',
+                initial_value_threshold=best_val_rmse, verbose=0,
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_rmse_metric', mode='min',
+                patience=config.early_stop_patience,
+                restore_best_weights=True, verbose=0,
+            ),
+            ConciseLogging(),
+        ]
+
+    def update_best(history):
+        nonlocal best_val_rmse
+        vals = history.history.get('val_rmse_metric', [])
+        if vals:
+            best_val_rmse = min(best_val_rmse, min(vals))
+
     # ── Phase 1: Warmup (Fixed layers, 128px) ──
     print(f'\n[Phase 1] Warmup (Frozen Backbone, {config.image_size_phase1}px)')
     freeze_base(base_model)
@@ -1599,12 +1681,13 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
 
     train_model = compile_for_phase(config.warmup_lr)
 
-    train_model.fit(
+    history = train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.warmup_epochs,
-        callbacks=[ConciseLogging()],
+        callbacks=phase_callbacks(),
         verbose=0,
     )
+    update_best(history)
 
     # ── Phase 2: Mid-tune (Partial unfreeze, 192px) ──
     print(f'\n[Phase 2] Mid-tune (Unfreeze {config.unfreeze_phase2} layers, {config.image_size_phase2}px)')
@@ -1626,12 +1709,13 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
         None if uses_benanne_schedule else steps_per_epoch,
     )
 
-    train_model.fit(
+    history = train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.midtune_epochs,
-        callbacks=[ConciseLogging()],
+        callbacks=phase_callbacks(),
         verbose=0,
     )
+    update_best(history)
 
     # ── Phase 3: Fine-tune (More unfreeze, 384px) ──
     print(f'\n[Phase 3] Fine-tune (Unfreeze {config.unfreeze_phase3} layers, {config.image_size_phase3}px)')
@@ -1653,19 +1737,13 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
         None if uses_benanne_schedule else steps_per_epoch,
     )
 
-    train_model.fit(
+    history = train_model.fit(
         train_ds, validation_data=val_ds,
         epochs=config.finetune_epochs,
-        callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(
-                str(output_dir / 'unified_best.keras'),
-                monitor='val_rmse_metric', save_best_only=True, mode='min',
-                verbose=0
-            ),
-            ConciseLogging(),
-        ],
+        callbacks=phase_callbacks(),
         verbose=0,
     )
+    update_best(history)
 
     # ── SWA ──
     if config.swa_epochs > 0 and not uses_benanne_schedule:

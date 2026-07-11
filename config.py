@@ -18,10 +18,15 @@ class Config:
     image_size_phase3: int = 424
     center_crop_ratio: float = 1.0
 
-    # ── Batch sizes (BASE per device - Highly conservative for dual T4 16GB GPUs to avoid System OOM) ──
-    batch_size_phase1: int = 4
-    batch_size_phase2: int = 4
-    batch_size_phase3: int = 4
+    # ── Batch sizes (BASE per device) ──
+    # BenanneNetTF is a small from-scratch convnet that immediately downsamples
+    # each image to 69x69 views, so its memory footprint is tiny and a batch of
+    # 4 leaves the accelerator badly underused with very noisy gradients. 32 is
+    # comfortable here. Lower these back toward 4-8 if you switch `architecture`
+    # to a heavy ImageNet backbone (EfficientNet/ConvNeXt) at full resolution.
+    batch_size_phase1: int = 32
+    batch_size_phase2: int = 32
+    batch_size_phase3: int = 32
     grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
@@ -34,11 +39,23 @@ class Config:
     architecture: str = 'BenanneNetTF'
     multi_view: bool = False
     
-    # ── Training Schedule (TEST RUN) ───────────────────────────
-    warmup_epochs: int = 1
-    midtune_epochs: int = 1
-    finetune_epochs: int = 1
-    
+    # ── Training Schedule ──────────────────────────────────────
+    # These are epoch CAPS, not fixed counts: EarlyStopping(restore_best_weights)
+    # in train.py stops each phase once validation RMSE stops improving, so
+    # setting them generously is safe. The three phases form a manual step-decay
+    # of the SGD learning rate (4e-2 -> 4e-3 -> 4e-4), each starting from the
+    # best weights of the previous phase.
+    #
+    # NOTE: the original benanne solution trained for ~67 GPU-hours. A single
+    # Kaggle session is capped at 12h with no resume logic here, so treat these
+    # as the main dial to trade run time against accuracy and watch the clock.
+    warmup_epochs: int = 25
+    midtune_epochs: int = 15
+    finetune_epochs: int = 15
+
+    # EarlyStopping patience (epochs without val-RMSE improvement) per phase.
+    early_stop_patience: int = 6
+
     warmup_lr: float = 4e-2
     midtune_lr: float = 4e-3
     finetune_lr: float = 4e-4

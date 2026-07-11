@@ -62,6 +62,12 @@ sequenceDiagram
 | **Optimizer** | Nesterov SGD | Matches the original winning training regime more closely than the earlier Adam fine-tuning setup. |
 | **Output Layer** | `GalaxyOutputLayer` | Predicts valid decision-tree-weighted probabilities directly. |
 
+> [!NOTE]
+> Two TensorFlow-side additions depart from the 2014 original: inputs are rescaled to
+> `[0, 1]` before the convnet, and each convolution is followed by BatchNorm
+> (`Conv → BatchNorm → ReLU`). Both stabilize from-scratch training under the high warmup
+> learning rate and were not part of benanne's original network.
+
 ---
 
 ## 🧪 Data Engineering & Augmentation
@@ -107,4 +113,7 @@ $$ RMSE = \sqrt{ \frac{1}{N_{samples}} \sum \frac{1}{37} \sum_{i=1}^{37} (y_i - 
 ---
 
 > [!IMPORTANT]
-> **State Note:** This repository explicitly dropped the legacy Classification Cascade structure in favor of Regression to directly target the Kaggle RMSE competition constraints, collapsing the codebase from 3,200 lines to ~1,250 highly performant lines.
+> **State Note:** This repository dropped the earlier classification-cascade structure in
+> favor of direct regression against the Kaggle RMSE metric. The pipeline is now a single
+> set of modules (`config`, `dataset`, `model`, `losses`, `train`, `evaluate`, `utils`)
+> merged into one Kaggle script by `scripts/consolidate.py`.

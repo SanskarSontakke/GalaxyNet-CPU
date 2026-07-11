@@ -33,7 +33,10 @@ env/
 *.keras
 *.h5
 *.pb
+
+# Generated result files (kept out of git), but keep the Kaggle kernel spec
 *.json
+!kernel-metadata.json
 
 # Jupyter
 .ipynb_checkpoints/
