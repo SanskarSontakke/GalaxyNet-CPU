@@ -1,6 +1,6 @@
 # GalaxyNet — Unified 37-Node Regression Pipeline
 
-Production-grade deep learning pipeline designed to predict the exact fractional human consensus distributions for the **Galaxy Zoo Challenge** on Kaggle. This model mathematically bypasses discrete classification, directly optimizing **Root Mean Squared Error (RMSE)** across the complete 37-dimensional spatial-attribute array.
+Kaggle submission that predicts fractional human consensus distributions for the Galaxy Zoo morphology challenge by directly optimizing RMSE across 37 morphological attributes instead of using discrete classification.
 
 > [!TIP]
 > **Curious about the math?** Start by reading the [Technical Deep Dive Guide](TECHNICAL_GUIDE.md) for architectural block diagrams and progressive resizing strategies.
