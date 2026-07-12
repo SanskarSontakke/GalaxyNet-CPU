@@ -27,7 +27,6 @@ class Config:
     batch_size_phase1: int = 32
     batch_size_phase2: int = 32
     batch_size_phase3: int = 32
-    grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
     seed: int = 42
@@ -64,13 +63,17 @@ class Config:
     unfreeze_phase3: int = 100 
     
     # ── Augmentation ───────────────────────────────────────────
-    mixup_alpha: float = 0.4
-    mixup_prob: float = 0.5
+    # Affine transform + colour perturbation always run during training. The
+    # switch below adds the optional sensor-noise / seeing / occlusion style
+    # augmentations (Poisson noise, Gaussian blur, cutout), each gated by its
+    # own probability. Set to False to train with the plain benanne pipeline.
+    enable_extra_augment: bool = True
+
+    cutout_prob: float = 0.3
     cutout_n_holes: int = 2
     cutout_max_size_ratio: float = 0.20
 
-    # ── Astronomy-Specific Augmentations (V26) ─────────────────
-    augment_poisson_scale: float = 25.0   
+    augment_poisson_scale: float = 25.0
     augment_poisson_prob: float = 0.3
     augment_blur_prob: float = 0.2
     augment_blur_sigma_range: Tuple[float, float] = (0.5, 2.0)

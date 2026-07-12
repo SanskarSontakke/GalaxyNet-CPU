@@ -109,7 +109,6 @@ class Config:
     batch_size_phase1: int = 32
     batch_size_phase2: int = 32
     batch_size_phase3: int = 32
-    grad_accumulation_steps: int = 1  # Disabled for MirroredStrategy stability
 
     # ── Data split ─────────────────────────────────────────────
     seed: int = 42
@@ -146,12 +145,16 @@ class Config:
     unfreeze_phase3: int = 100
 
     # ── Augmentation ───────────────────────────────────────────
-    mixup_alpha: float = 0.4
-    mixup_prob: float = 0.5
+    # Affine transform + colour perturbation always run during training. The
+    # switch below adds the optional sensor-noise / seeing / occlusion style
+    # augmentations (Poisson noise, Gaussian blur, cutout), each gated by its
+    # own probability. Set to False to train with the plain benanne pipeline.
+    enable_extra_augment: bool = True
+
+    cutout_prob: float = 0.3
     cutout_n_holes: int = 2
     cutout_max_size_ratio: float = 0.20
 
-    # ── Astronomy-Specific Augmentations (V26) ─────────────────
     augment_poisson_scale: float = 25.0
     augment_poisson_prob: float = 0.3
     augment_blur_prob: float = 0.2
@@ -335,141 +338,6 @@ def save_json(path: Path, payload: dict) -> None:
 
 def is_kaggle_runtime() -> bool:
     return os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
-
-
-# ══════════════════════════════════════════════════════════════
-# V25 — GRADIENT ACCUMULATION HELPER
-# ══════════════════════════════════════════════════════════════
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class GradientAccumulationModel(tf.keras.Model):
-    """Wrapper model that accumulates gradients over N mini-batches
-    before applying an optimizer step. This allows effective large
-    batch sizes when VRAM is limited (e.g., batch_size=16 × accum=2 = 32 effective).
-
-    Usage:
-        ga_model = GradientAccumulationModel(base_model, accumulation_steps=2)
-        ga_model.compile(optimizer=..., loss=..., metrics=...)
-        ga_model.fit(train_ds, ...)
-    """
-
-    def __init__(self, inner_model: tf.keras.Model, accumulation_steps: int = 2, **kwargs):
-        super().__init__(**kwargs)
-        self.inner_model = inner_model
-        self.accumulation_steps = accumulation_steps
-        self.step_count = tf.Variable(0, trainable=False, dtype=tf.int32)
-        self._accum_gradients = None
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "inner_model": self.inner_model,
-            "accumulation_steps": self.accumulation_steps,
-        })
-        return config
-
-    def call(self, inputs, training=False):
-        return self.inner_model(inputs, training=training)
-
-    @property
-    def trainable_variables(self):
-        return self.inner_model.trainable_variables
-
-    def train_step(self, data):
-        if len(data) == 3:
-            x, y, sample_weight = data
-        else:
-            x, y = data
-            sample_weight = None
-
-        # Initialize gradient accumulators on first call
-        if self._accum_gradients is None:
-            self._accum_gradients = [
-                tf.Variable(tf.zeros_like(v), trainable=False)
-                for v in self.inner_model.trainable_variables
-            ]
-
-        with tf.GradientTape() as tape:
-            y_pred = self.inner_model(x, training=True)
-            loss = self.compiled_loss(y, y_pred, sample_weight=sample_weight)
-            # Scale loss for accumulation
-            scaled_loss = loss / tf.cast(self.accumulation_steps, tf.float32)
-
-        gradients = tape.gradient(scaled_loss, self.inner_model.trainable_variables)
-
-        # Accumulate
-        for accum, grad in zip(self._accum_gradients, gradients):
-            if grad is not None:
-                accum.assign_add(grad)
-
-        self.step_count.assign_add(1)
-
-        # Apply when accumulation is complete
-        tf.cond(
-            tf.equal(self.step_count % self.accumulation_steps, 0),
-            lambda: self._apply_and_reset(),
-            lambda: None,
-        )
-
-        # Update metrics
-        self.compiled_metrics.update_state(y, y_pred, sample_weight=sample_weight)
-        return {m.name: m.result() for m in self.metrics}
-
-    def _apply_and_reset(self):
-        self.optimizer.apply_gradients(
-            zip(self._accum_gradients, self.inner_model.trainable_variables)
-        )
-        for accum in self._accum_gradients:
-            accum.assign(tf.zeros_like(accum))
-
-
-# ══════════════════════════════════════════════════════════════
-# V25 — LAYER-WISE LEARNING RATE DECAY (LLRD)
-# ══════════════════════════════════════════════════════════════
-
-def build_llrd_optimizer(
-    model: tf.keras.Model,
-    base_lr: float,
-    decay_factor: float = 0.75,
-    clipnorm: float = 1.0,
-) -> tf.keras.optimizers.Adam:
-    """Build an Adam optimizer with layer-wise learning rate decay (LLRD).
-
-    Deeper (earlier) layers get exponentially lower learning rates.
-    This prevents catastrophic forgetting of pre-trained features while
-    allowing the head layers to adapt aggressively.
-
-    For TF2/Keras, we implement this using a single optimizer with per-variable
-    learning rate scaling via optimizer.build() and custom LR multipliers,
-    simplified as grouped parameter approach.
-
-    In practice, we use a simple 3-group approach:
-      - Head layers (custom dense/BN): base_lr
-      - Top backbone layers (unfrozen): base_lr × decay_factor
-      - Lower backbone layers (if unfrozen): base_lr × decay_factor^2
-
-    Args:
-        model: The full model (head + backbone)
-        base_lr: Learning rate for head layers
-        decay_factor: Multiplicative decay per depth group
-        clipnorm: Gradient clipping norm
-
-    Returns:
-        Configured Adam optimizer
-    """
-    # For Keras 3.x / TF 2.16+, use the standard Adam with gradient clipping
-    # LLRD is approximated by setting per-layer trainable status and
-    # using different LR schedules during training phases.
-    # The actual per-variable LR in TF2 requires tf.keras.optimizers.legacy.Adam
-    # which is deprecated. Instead, we rely on progressive unfreezing which
-    # achieves a similar effect: earlier unfrozen layers have already been
-    # fine-tuned at lower LR in earlier phases.
-
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=base_lr,
-        clipnorm=clipnorm,
-    )
-    return optimizer
 
 
 def build_cosine_restart_schedule(
@@ -1018,6 +886,23 @@ def freeze_base(base_model: tf.keras.Model) -> None:
 
 
 
+@dataclass(frozen=True)
+class AugmentParams:
+    """Probabilities and strengths for the optional (non-affine) augmentations.
+
+    All probabilities default to 0.0, so callers that do not pass an
+    AugmentParams keep the plain benanne behaviour (affine + colour only).
+    train.py builds one of these from Config when extra augmentation is enabled.
+    """
+    cutout_prob: float = 0.0
+    cutout_n_holes: int = 2
+    cutout_max_size_ratio: float = 0.20
+    poisson_prob: float = 0.0
+    poisson_scale: float = 25.0
+    blur_prob: float = 0.0
+    blur_sigma_range: Tuple[float, float] = (0.5, 2.0)
+
+
 COLOUR_CHANNEL_WEIGHTS = tf.constant(
     [-0.0148366, -0.01253134, -0.01040762],
     dtype=tf.float32,
@@ -1220,7 +1105,18 @@ def apply_colour_perturbation(image: tf.Tensor, std: float = 0.5) -> tf.Tensor:
     return image * 255.0
 
 
-def augment_image(image: tf.Tensor, label: tf.Tensor):
+def _maybe_apply(image: tf.Tensor, prob: float, fn) -> tf.Tensor:
+    """Apply ``fn`` to ``image`` with the given probability.
+
+    ``prob`` is a Python float known at graph-build time, so a probability of
+    0.0 is short-circuited without emitting a tf.cond at all.
+    """
+    if prob <= 0.0:
+        return image
+    return tf.cond(tf.random.uniform([]) < prob, lambda: fn(image), lambda: image)
+
+
+def augment_image(image: tf.Tensor, label: tf.Tensor, params: AugmentParams | None = None):
     h = tf.cast(tf.shape(image)[0], tf.float32)
     w = tf.cast(tf.shape(image)[1], tf.float32)
     scale_x = w / 424.0
@@ -1241,7 +1137,32 @@ def augment_image(image: tf.Tensor, label: tf.Tensor):
         translate_y=translate_y,
         flip_left_right=flip_left_right,
     )
+
+    # Optional astronomy-flavoured augmentations, each gated by its probability.
+    # These are no-ops unless an AugmentParams with non-zero probabilities is
+    # passed in (train.py wires this from Config when extra augmentation is on).
+    if params is not None:
+        image = _maybe_apply(
+            image, params.poisson_prob,
+            lambda im: apply_poisson_noise(im, params.poisson_scale),
+        )
+
+        def _blur(im: tf.Tensor) -> tf.Tensor:
+            sigma = tf.random.uniform(
+                [], params.blur_sigma_range[0], params.blur_sigma_range[1]
+            )
+            return apply_gaussian_blur(im, sigma)
+
+        image = _maybe_apply(image, params.blur_prob, _blur)
+
     image = apply_colour_perturbation(image, std=0.5)
+
+    if params is not None:
+        image = _maybe_apply(
+            image, params.cutout_prob,
+            lambda im: apply_cutout(im, params.cutout_n_holes, params.cutout_max_size_ratio),
+        )
+
     image = tf.clip_by_value(image, 0.0, 255.0)
     return image, label
 
@@ -1279,6 +1200,7 @@ def build_dataset(
     cache: bool = False,
     drop_remainder: bool = False,
     tta_index: int | None = None,
+    aug_params: AugmentParams | None = None,
 ) -> tf.data.Dataset:
     """Build a tf.data.Dataset mapping paths and 37-node target vectors."""
     if augment and tta_index is not None:
@@ -1294,7 +1216,7 @@ def build_dataset(
         ds = ds.shuffle(buffer_size=min(len(image_paths), 10000), reshuffle_each_iteration=True)
 
     if augment:
-        ds = ds.map(lambda i, l: augment_image(i, l), num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(lambda i, l: augment_image(i, l, aug_params), num_parallel_calls=tf.data.AUTOTUNE)
 
     if tta_index is not None:
         ds = ds.map(
@@ -1306,6 +1228,40 @@ def build_dataset(
         ds = ds.cache()
 
     ds = ds.batch(batch_size, drop_remainder=drop_remainder).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+def build_tta_dataset(
+    image_paths: np.ndarray,
+    image_size: int,
+    batch_size: int,
+    n_augments: int,
+    center_crop_ratio: float = 0.75,
+) -> tf.data.Dataset:
+    """Decode each image once and emit all `n_augments` deterministic TTA variants.
+
+    Variants are streamed in image-major, augment-minor order:
+    ``[img0_tta0, img0_tta1, ..., img0_tta{k-1}, img1_tta0, ...]``. Predicting
+    over this dataset and reshaping to ``(num_images, n_augments, -1)`` then
+    averaging over axis 1 reproduces the mean-over-TTA-passes result — but each
+    JPEG is read and decoded a single time instead of once per pass, which is
+    the dominant cost of test-time augmentation over large image sets.
+    """
+    dummy_label = tf.zeros([37], dtype=tf.float32)
+
+    def _load_variants(path):
+        image, _ = load_and_preprocess_image(path, dummy_label, image_size, center_crop_ratio)
+        # apply_tta_transform requires a Python int index (it indexes a Python
+        # list of zoom factors), so the variants are unrolled in a Python loop.
+        variants = [apply_tta_transform(image, dummy_label, i)[0] for i in range(n_augments)]
+        return tf.stack(variants, axis=0)  # (n_augments, H, W, 3)
+
+    ds = tf.data.Dataset.from_tensor_slices(image_paths)
+    # Modest fixed parallelism: each element holds n_augments full-size images,
+    # so bound how many are in flight at once to keep memory predictable.
+    ds = ds.map(_load_variants, num_parallel_calls=4)
+    ds = ds.unbatch()
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
@@ -1390,35 +1346,26 @@ def load_inference_model(model_path: Path) -> tf.keras.Model:
 
 
 def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -> np.ndarray:
-    """Run Test-Time Augmentation (TTA) and return averaged predictions."""
-    print(f"\n[Evaluation] Running TTA ({config.tta_n_augments} passes)...")
+    """Run Test-Time Augmentation (TTA) and return averaged predictions.
 
-    # Dummy labels for the dataset builder
-    dummy_labels = np.zeros((len(test_paths), 37), dtype=np.float32)
+    Each image is decoded once and expanded into all `tta_n_augments`
+    deterministic variants (see dataset.build_tta_dataset), rather than
+    rebuilding and re-decoding the whole set once per pass. The predictions are
+    then reshaped back to (num_images, n_augments, targets) and averaged over
+    the augmentation axis.
+    """
+    n_augments = config.tta_n_augments
+    print(f"\n[Evaluation] Running TTA ({n_augments} passes, single decode per image)...")
 
-    tta_preds = []
-
-    # Pass 1: Original (unaugmented) center crop
-    ds_base = build_dataset(
-        test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
-        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
-        drop_remainder=False, tta_index=0,
+    ds = build_tta_dataset(
+        test_paths, config.image_size_phase3, config.batch_size_phase3,
+        n_augments, center_crop_ratio=config.center_crop_ratio,
     )
-    base_preds = model.predict(ds_base, verbose=1)
-    tta_preds.append(base_preds)
+    preds = model.predict(ds, verbose=1)  # (num_images * n_augments, targets)
 
-    # Passes 2 to N: Augmented crops/rotations
-    for i in range(config.tta_n_augments - 1):
-        ds_aug = build_dataset(
-            test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
-            center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
-            drop_remainder=False, tta_index=i + 1,
-        )
-        preds = model.predict(ds_aug, verbose=0)
-        tta_preds.append(preds)
-        print(f"  TTA pass {i+2}/{config.tta_n_augments} completed.")
-
-    return np.mean(tta_preds, axis=0)
+    num_images = len(test_paths)
+    preds = preds.reshape(num_images, n_augments, -1)
+    return preds.mean(axis=1)
 
 
 def _load_submission_template(submission_template_path: Path) -> tuple[list[str], list[int]]:
@@ -1602,6 +1549,20 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     val_labels = val_df[target_cols].values.astype(np.float32)
     uses_benanne_schedule = config.architecture == 'BenanneNetTF'
 
+    # Optional (non-affine) augmentations, built from config once and reused
+    # across phases. None means only the always-on affine + colour perturbation.
+    aug_params = None
+    if config.enable_extra_augment:
+        aug_params = AugmentParams(
+            cutout_prob=config.cutout_prob,
+            cutout_n_holes=config.cutout_n_holes,
+            cutout_max_size_ratio=config.cutout_max_size_ratio,
+            poisson_prob=config.augment_poisson_prob,
+            poisson_scale=config.augment_poisson_scale,
+            blur_prob=config.augment_blur_prob,
+            blur_sigma_range=config.augment_blur_sigma_range,
+        )
+
     # Scale batch sizes by number of TPU replicas
     bs1 = config.get_scaled_batch_size(config.batch_size_phase1, strategy)
     bs2 = config.get_scaled_batch_size(config.batch_size_phase2, strategy)
@@ -1672,7 +1633,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase1, bs1,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
-        drop_remainder=True,
+        drop_remainder=True, aug_params=aug_params,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase1, bs1,
@@ -1696,7 +1657,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase2, bs2,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
-        drop_remainder=True,
+        drop_remainder=True, aug_params=aug_params,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase2, bs2,
@@ -1724,7 +1685,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
-        drop_remainder=True,
+        drop_remainder=True, aug_params=aug_params,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase3, bs3,

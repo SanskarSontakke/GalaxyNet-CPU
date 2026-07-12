@@ -10,7 +10,7 @@ import pandas as pd
 import tensorflow as tf
 
 from config import Config
-from dataset import build_dataset
+from dataset import build_dataset, build_tta_dataset
 from losses import HierarchicalRMSELoss, RMSELoss, rmse_metric
 from model import (
     BenannePartExtractor,
@@ -48,35 +48,26 @@ def load_inference_model(model_path: Path) -> tf.keras.Model:
 
 
 def predict_tta(model: tf.keras.Model, test_paths: np.ndarray, config: Config) -> np.ndarray:
-    """Run Test-Time Augmentation (TTA) and return averaged predictions."""
-    print(f"\n[Evaluation] Running TTA ({config.tta_n_augments} passes)...")
-    
-    # Dummy labels for the dataset builder
-    dummy_labels = np.zeros((len(test_paths), 37), dtype=np.float32)
-    
-    tta_preds = []
-    
-    # Pass 1: Original (unaugmented) center crop
-    ds_base = build_dataset(
-        test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
-        center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
-        drop_remainder=False, tta_index=0,
+    """Run Test-Time Augmentation (TTA) and return averaged predictions.
+
+    Each image is decoded once and expanded into all `tta_n_augments`
+    deterministic variants (see dataset.build_tta_dataset), rather than
+    rebuilding and re-decoding the whole set once per pass. The predictions are
+    then reshaped back to (num_images, n_augments, targets) and averaged over
+    the augmentation axis.
+    """
+    n_augments = config.tta_n_augments
+    print(f"\n[Evaluation] Running TTA ({n_augments} passes, single decode per image)...")
+
+    ds = build_tta_dataset(
+        test_paths, config.image_size_phase3, config.batch_size_phase3,
+        n_augments, center_crop_ratio=config.center_crop_ratio,
     )
-    base_preds = model.predict(ds_base, verbose=1)
-    tta_preds.append(base_preds)
-    
-    # Passes 2 to N: Augmented crops/rotations
-    for i in range(config.tta_n_augments - 1):
-        ds_aug = build_dataset(
-            test_paths, dummy_labels, config.image_size_phase3, config.batch_size_phase3,
-            center_crop_ratio=config.center_crop_ratio, augment=False, shuffle=False,
-            drop_remainder=False, tta_index=i + 1,
-        )
-        preds = model.predict(ds_aug, verbose=0)
-        tta_preds.append(preds)
-        print(f"  TTA pass {i+2}/{config.tta_n_augments} completed.")
-        
-    return np.mean(tta_preds, axis=0)
+    preds = model.predict(ds, verbose=1)  # (num_images * n_augments, targets)
+
+    num_images = len(test_paths)
+    preds = preds.reshape(num_images, n_augments, -1)
+    return preds.mean(axis=1)
 
 
 def _load_submission_template(submission_template_path: Path) -> tuple[list[str], list[int]]:

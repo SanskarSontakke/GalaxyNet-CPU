@@ -26,6 +26,7 @@ tf.keras.utils.disable_interactive_logging()
 
 from config import Config
 from dataset import (
+    AugmentParams,
     build_dataset,
     build_datasets,
     generate_labels_df,
@@ -81,6 +82,20 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     val_paths = val_df['image_path'].values
     val_labels = val_df[target_cols].values.astype(np.float32)
     uses_benanne_schedule = config.architecture == 'BenanneNetTF'
+
+    # Optional (non-affine) augmentations, built from config once and reused
+    # across phases. None means only the always-on affine + colour perturbation.
+    aug_params = None
+    if config.enable_extra_augment:
+        aug_params = AugmentParams(
+            cutout_prob=config.cutout_prob,
+            cutout_n_holes=config.cutout_n_holes,
+            cutout_max_size_ratio=config.cutout_max_size_ratio,
+            poisson_prob=config.augment_poisson_prob,
+            poisson_scale=config.augment_poisson_scale,
+            blur_prob=config.augment_blur_prob,
+            blur_sigma_range=config.augment_blur_sigma_range,
+        )
 
     # Scale batch sizes by number of TPU replicas
     bs1 = config.get_scaled_batch_size(config.batch_size_phase1, strategy)
@@ -152,7 +167,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase1, bs1,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
-        drop_remainder=True,
+        drop_remainder=True, aug_params=aug_params,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase1, bs1,
@@ -176,7 +191,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase2, bs2,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
-        drop_remainder=True,
+        drop_remainder=True, aug_params=aug_params,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase2, bs2,
@@ -204,7 +219,7 @@ def train_unified_regression(config: Config, solutions_csv: Path, image_dir: Pat
     train_ds = build_dataset(
         train_paths, train_labels, config.image_size_phase3, bs3,
         center_crop_ratio=config.center_crop_ratio, augment=True, shuffle=True,
-        drop_remainder=True,
+        drop_remainder=True, aug_params=aug_params,
     )
     val_ds = build_dataset(
         val_paths, val_labels, config.image_size_phase3, bs3,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,6 +11,23 @@ import tensorflow as tf
 from sklearn.model_selection import train_test_split
 
 from config import Config
+
+
+@dataclass(frozen=True)
+class AugmentParams:
+    """Probabilities and strengths for the optional (non-affine) augmentations.
+
+    All probabilities default to 0.0, so callers that do not pass an
+    AugmentParams keep the plain benanne behaviour (affine + colour only).
+    train.py builds one of these from Config when extra augmentation is enabled.
+    """
+    cutout_prob: float = 0.0
+    cutout_n_holes: int = 2
+    cutout_max_size_ratio: float = 0.20
+    poisson_prob: float = 0.0
+    poisson_scale: float = 25.0
+    blur_prob: float = 0.0
+    blur_sigma_range: Tuple[float, float] = (0.5, 2.0)
 
 try:
     import tensorflow_addons as tfa
@@ -217,7 +236,18 @@ def apply_colour_perturbation(image: tf.Tensor, std: float = 0.5) -> tf.Tensor:
     return image * 255.0
 
 
-def augment_image(image: tf.Tensor, label: tf.Tensor):
+def _maybe_apply(image: tf.Tensor, prob: float, fn) -> tf.Tensor:
+    """Apply ``fn`` to ``image`` with the given probability.
+
+    ``prob`` is a Python float known at graph-build time, so a probability of
+    0.0 is short-circuited without emitting a tf.cond at all.
+    """
+    if prob <= 0.0:
+        return image
+    return tf.cond(tf.random.uniform([]) < prob, lambda: fn(image), lambda: image)
+
+
+def augment_image(image: tf.Tensor, label: tf.Tensor, params: AugmentParams | None = None):
     h = tf.cast(tf.shape(image)[0], tf.float32)
     w = tf.cast(tf.shape(image)[1], tf.float32)
     scale_x = w / 424.0
@@ -238,7 +268,32 @@ def augment_image(image: tf.Tensor, label: tf.Tensor):
         translate_y=translate_y,
         flip_left_right=flip_left_right,
     )
+
+    # Optional astronomy-flavoured augmentations, each gated by its probability.
+    # These are no-ops unless an AugmentParams with non-zero probabilities is
+    # passed in (train.py wires this from Config when extra augmentation is on).
+    if params is not None:
+        image = _maybe_apply(
+            image, params.poisson_prob,
+            lambda im: apply_poisson_noise(im, params.poisson_scale),
+        )
+
+        def _blur(im: tf.Tensor) -> tf.Tensor:
+            sigma = tf.random.uniform(
+                [], params.blur_sigma_range[0], params.blur_sigma_range[1]
+            )
+            return apply_gaussian_blur(im, sigma)
+
+        image = _maybe_apply(image, params.blur_prob, _blur)
+
     image = apply_colour_perturbation(image, std=0.5)
+
+    if params is not None:
+        image = _maybe_apply(
+            image, params.cutout_prob,
+            lambda im: apply_cutout(im, params.cutout_n_holes, params.cutout_max_size_ratio),
+        )
+
     image = tf.clip_by_value(image, 0.0, 255.0)
     return image, label
 
@@ -276,6 +331,7 @@ def build_dataset(
     cache: bool = False,
     drop_remainder: bool = False,
     tta_index: int | None = None,
+    aug_params: AugmentParams | None = None,
 ) -> tf.data.Dataset:
     """Build a tf.data.Dataset mapping paths and 37-node target vectors."""
     if augment and tta_index is not None:
@@ -291,7 +347,7 @@ def build_dataset(
         ds = ds.shuffle(buffer_size=min(len(image_paths), 10000), reshuffle_each_iteration=True)
 
     if augment:
-        ds = ds.map(lambda i, l: augment_image(i, l), num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.map(lambda i, l: augment_image(i, l, aug_params), num_parallel_calls=tf.data.AUTOTUNE)
 
     if tta_index is not None:
         ds = ds.map(
@@ -303,6 +359,40 @@ def build_dataset(
         ds = ds.cache()
 
     ds = ds.batch(batch_size, drop_remainder=drop_remainder).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+def build_tta_dataset(
+    image_paths: np.ndarray,
+    image_size: int,
+    batch_size: int,
+    n_augments: int,
+    center_crop_ratio: float = 0.75,
+) -> tf.data.Dataset:
+    """Decode each image once and emit all `n_augments` deterministic TTA variants.
+
+    Variants are streamed in image-major, augment-minor order:
+    ``[img0_tta0, img0_tta1, ..., img0_tta{k-1}, img1_tta0, ...]``. Predicting
+    over this dataset and reshaping to ``(num_images, n_augments, -1)`` then
+    averaging over axis 1 reproduces the mean-over-TTA-passes result — but each
+    JPEG is read and decoded a single time instead of once per pass, which is
+    the dominant cost of test-time augmentation over large image sets.
+    """
+    dummy_label = tf.zeros([37], dtype=tf.float32)
+
+    def _load_variants(path):
+        image, _ = load_and_preprocess_image(path, dummy_label, image_size, center_crop_ratio)
+        # apply_tta_transform requires a Python int index (it indexes a Python
+        # list of zoom factors), so the variants are unrolled in a Python loop.
+        variants = [apply_tta_transform(image, dummy_label, i)[0] for i in range(n_augments)]
+        return tf.stack(variants, axis=0)  # (n_augments, H, W, 3)
+
+    ds = tf.data.Dataset.from_tensor_slices(image_paths)
+    # Modest fixed parallelism: each element holds n_augments full-size images,
+    # so bound how many are in flight at once to keep memory predictable.
+    ds = ds.map(_load_variants, num_parallel_calls=4)
+    ds = ds.unbatch()
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
